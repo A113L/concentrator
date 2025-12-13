@@ -334,7 +334,7 @@ def memory_intensive_operation_warning(operation_name):
     return True
 
 # ==============================================================================
-# INTERACTIVE MODE FUNCTION
+# INTERACTIVE MODE FUNCTION - UPDATED WITH INPUT ANALYSIS
 # ==============================================================================
 
 def interactive_mode():
@@ -365,11 +365,82 @@ def interactive_mode():
         else:
             print_error("Please provide at least one path.")
     
+    # Now analyze the input to provide recommendations
+    print(f"\n{Colors.CYAN}Analyzing Input Data...{Colors.END}")
+    
+    # Quick analysis of input files
+    try:
+        # Find rule files
+        all_filepaths = find_rule_files_recursive(settings['paths'], max_depth=3)
+        
+        if not all_filepaths:
+            print_error("No rule files found in the provided paths.")
+            return None
+        
+        print_success(f"Found {len(all_filepaths)} rule files.")
+        
+        # Quick scan for analysis
+        total_rules = 0
+        unique_rules = set()
+        max_rule_len = 0
+        
+        for filepath in all_filepaths[:10]:  # Sample first 10 files for quick analysis
+            try:
+                with open(filepath, 'r', errors='ignore') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#') or len(line) > 100:
+                            continue
+                        total_rules += 1
+                        unique_rules.add(line)
+                        max_rule_len = max(max_rule_len, len(line))
+            except:
+                continue
+        
+        # Estimate total rules (extrapolate from sample)
+        estimated_total_rules = total_rules * max(1, len(all_filepaths) // 10)
+        
+        print(f"{Colors.CYAN}Quick Analysis Results:{Colors.END}")
+        print(f"  Files found: {len(all_filepaths)}")
+        print(f"  Sampled rules: {total_rules}")
+        print(f"  Estimated total rules: {estimated_total_rules:,}")
+        print(f"  Unique rules in sample: {len(unique_rules)}")
+        print(f"  Max rule length observed: {max_rule_len}")
+        
+        # Mode recommendations based on analysis
+        print(f"\n{Colors.CYAN}Mode Recommendations:{Colors.END}")
+        
+        if estimated_total_rules < 1000:
+            print(f"  {Colors.GREEN}•{Colors.END} Small dataset: Consider {Colors.YELLOW}Combinatorial Generation{Colors.END} mode")
+            print(f"  {Colors.GREEN}•{Colors.END} You have room to expand with new rule combinations")
+            recommended_mode = 'combo'
+        elif len(unique_rules) / max(1, total_rules) < 0.3:
+            print(f"  {Colors.GREEN}•{Colors.END} Low uniqueness: Consider {Colors.YELLOW}Extraction{Colors.END} mode")
+            print(f"  {Colors.GREEN}•{Colors.END} Focus on extracting the most effective existing rules")
+            recommended_mode = 'extraction'
+        else:
+            print(f"  {Colors.GREEN}•{Colors.END} Good dataset diversity: Consider {Colors.YELLOW}Markov{Colors.END} mode")
+            print(f"  {Colors.GREEN}•{Colors.END} Generate statistically probable new rules")
+            recommended_mode = 'markov'
+            
+        # Additional recommendations based on rule length
+        if max_rule_len > 20:
+            print(f"  {Colors.GREEN}•{Colors.END} Long rules detected: Enable {Colors.YELLOW}functional minimization{Colors.END}")
+        
+    except Exception as e:
+        print_warning(f"Quick analysis failed: {e}")
+        print(f"  {Colors.YELLOW}Continuing with manual mode selection...{Colors.END}")
+        recommended_mode = None
+    
     # Choose mode
     print(f"\n{Colors.CYAN}Processing Mode:{Colors.END}")
     print(f"  {Colors.GREEN}1{Colors.END} - Extract top existing rules")
     print(f"  {Colors.GREEN}2{Colors.END} - Generate combinatorial rules") 
     print(f"  {Colors.GREEN}3{Colors.END} - Generate Markov rules")
+    
+    if recommended_mode:
+        mode_display = {'extraction': '1', 'combo': '2', 'markov': '3'}
+        print(f"{Colors.YELLOW}  Recommended based on analysis: Mode {mode_display[recommended_mode]}{Colors.END}")
     
     while True:
         mode_choice = input(f"{Colors.YELLOW}Select mode (1-3): {Colors.END}").strip()
