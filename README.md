@@ -1,7 +1,5 @@
 **Concentrator v3.0: Unified Hashcat Rule Processor**
 
-[![concentrator.png](https://i.postimg.cc/gjmvFF5m/concentrator.png)](https://postimg.cc/62b7nStm)
-
 Concentrator v3.0 is an advanced, high-performance tool written in Python 3 designed to unify the processes of extracting, validating, cleaning, and generating highly effective Hashcat rulesets. It features multi-processing for parallel file ingestion and optional OpenCL (GPU) acceleration for massive-scale rule validation and filtering.
 
 ✨ **Key Features**
