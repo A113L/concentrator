@@ -17,6 +17,7 @@ import tempfile
 import subprocess
 import random
 import datetime
+import threading
 from collections import defaultdict, Counter
 from typing import List, Tuple, Dict, Callable, Any, Set
 
@@ -79,6 +80,8 @@ _IN_MEMORY_MODE = False
 _OPENCL_CONTEXT = None
 _OPENCL_QUEUE = None
 _OPENCL_PROGRAM = None
+_cleanup_lock = threading.Lock()
+_cleanup_in_progress = False
 
 # Color codes for terminal output
 class Colors:
@@ -183,30 +186,39 @@ def get_yes_no(prompt: str, default: bool = True) -> bool:
     return response in ['y', 'yes']
 
 # ==============================================================================
-# MEMORY MANAGEMENT AND SAFETY
+# MEMORY MANAGEMENT AND SAFETY - FIXED VERSION
 # ==============================================================================
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C and other termination signals to clean up temporary files."""
+    global _cleanup_in_progress
+    
+    # Prevent multiple cleanup operations from running simultaneously
+    with _cleanup_lock:
+        if _cleanup_in_progress:
+            return  # Already cleaning up, ignore duplicate signal
+        _cleanup_in_progress = True
+    
+    # Only the main process should perform cleanup
+    if multiprocessing.current_process().name != 'MainProcess':
+        sys.exit(0)  # Child processes just exit immediately
+    
     print(f"\n{Colors.RED}⚠️  INTERRUPT RECEIVED - Cleaning up...{Colors.RESET}")
     
     # Clean up temporary files
     if _temp_files_to_cleanup:
         print(f"{Colors.YELLOW}Cleaning up temporary files...{Colors.RESET}")
-        for temp_file in _temp_files_to_cleanup:
+        for temp_file in _temp_files_to_cleanup[:]:  # Use slice copy
             try:
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
                     print(f"{Colors.GREEN}✓ Removed temporary file: {temp_file}{Colors.RESET}")
             except Exception as e:
-                print(f"{Colors.RED}✗ Error removing {temp_file}: {e}{Colors.RESET}")
+                # Don't print errors during cleanup to avoid clutter
+                pass
     
     print(f"{Colors.RED}Script terminated by user.{Colors.RESET}")
     sys.exit(1)
-
-# Register signal handlers
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 def get_memory_usage():
     """Get current memory usage statistics."""
@@ -974,7 +986,7 @@ def gpu_validate_rules(rules_list, max_rule_length=64):
         return [is_valid_hashcat_rule(rule) for rule in rules_list]
 
 # ==============================================================================
-# PARALLEL FILE PROCESSING
+# PARALLEL FILE PROCESSING - FIXED VERSION
 # ==============================================================================
 
 def process_single_file(filepath, max_rule_length):
@@ -984,7 +996,7 @@ def process_single_file(filepath, max_rule_length):
     clean_rules_list = []
     temp_rule_filepath = None
     
-    global _IN_MEMORY_MODE, _TEMP_DIR_PATH
+    global _IN_MEMORY_MODE, _TEMP_DIR_PATH, _temp_files_to_cleanup
 
     try:
         with open(filepath, 'r', errors='ignore') as f:
@@ -1026,12 +1038,25 @@ def process_single_file(filepath, max_rule_length):
             
         if not _IN_MEMORY_MODE:
             # --- FILE MODE: Write collected rules to a temporary file ---
-            temp_rule_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8', dir=_TEMP_DIR_PATH)
+            import tempfile
+            temp_rule_file = tempfile.NamedTemporaryFile(
+                mode='w+', 
+                delete=False, 
+                encoding='utf-8', 
+                dir=_TEMP_DIR_PATH,
+                prefix='concentrator_',
+                suffix='.tmp'
+            )
             temp_rule_filepath = temp_rule_file.name
-            _temp_files_to_cleanup.append(temp_rule_filepath)  # Register for cleanup
+            # Write rules
             for rule in clean_rules_list:
                 temp_rule_file.write(rule + '\n')
-            temp_rule_file.close()  
+            temp_rule_file.close()
+            
+            # Register for cleanup (thread-safe)
+            with _cleanup_lock:
+                _temp_files_to_cleanup.append(temp_rule_filepath)
+            
             print_success(f"File analysis complete: {filepath}. Temp rules saved to {temp_rule_filepath}")
             return operator_counts, full_rule_counts, [], temp_rule_filepath
         else:
@@ -1041,8 +1066,15 @@ def process_single_file(filepath, max_rule_length):
             
     except Exception as e:
         print_error(f"An error occurred while processing {filepath}: {e}")
+        # Clean up temp file if it was created
         if temp_rule_filepath and os.path.exists(temp_rule_filepath):
-            cleanup_temp_file(temp_rule_filepath)
+            try:
+                os.remove(temp_rule_filepath)
+                with _cleanup_lock:
+                    if temp_rule_filepath in _temp_files_to_cleanup:
+                        _temp_files_to_cleanup.remove(temp_rule_filepath)
+            except:
+                pass
         return defaultdict(int), defaultdict(int), [], None
 
 def analyze_rule_files_parallel(filepaths, max_rule_length):
@@ -1053,7 +1085,7 @@ def analyze_rule_files_parallel(filepaths, max_rule_length):
     temp_files_to_merge = []
     total_all_clean_rules = []
     
-    global _IN_MEMORY_MODE
+    global _IN_MEMORY_MODE, _cleanup_lock
     
     existing_filepaths = [fp for fp in filepaths if os.path.exists(fp) and os.path.isfile(fp)]
     
@@ -1085,9 +1117,19 @@ def analyze_rule_files_parallel(filepaths, max_rule_length):
         print_info("Merging temporary rule files into memory for Markov processing...")
         for temp_filepath in temp_files_to_merge:
             try:
-                with open(temp_filepath, 'r', encoding='utf-8') as f:
-                    total_all_clean_rules.extend([line.strip() for line in f])
-                cleanup_temp_file(temp_filepath)
+                # Check if file still exists before attempting to read
+                if os.path.exists(temp_filepath):
+                    with open(temp_filepath, 'r', encoding='utf-8') as f:
+                        total_all_clean_rules.extend([line.strip() for line in f])
+                else:
+                    print_warning(f"Temp file {temp_filepath} no longer exists, skipping...")
+                
+                # Clean up the temp file after successful merge
+                if os.path.exists(temp_filepath):
+                    os.remove(temp_filepath)
+                    with _cleanup_lock:
+                        if temp_filepath in _temp_files_to_cleanup:
+                            _temp_files_to_cleanup.remove(temp_filepath)
             except Exception as e:
                 print_error(f"Error merging temp file {temp_filepath}: {e}")
             
@@ -2604,6 +2646,10 @@ def print_usage():
     print()
 
 if __name__ == '__main__':
+    # Register signal handlers ONLY for the main process
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     multiprocessing.freeze_support()  
     
     # Print banner
@@ -2734,3 +2780,4 @@ if __name__ == '__main__':
     # Cleanup temporary files
     cleanup_temp_files()
     sys.exit(0)
+
