@@ -62,9 +62,10 @@ Combined Features:
   • Levenshtein Distance Filtering
   • Smart Processing Selection & Memory Safety
   • Interactive & CLI Modes with Colorized Output
+  • Multiple output formats: line, expanded
 ================================================================================
 
-Memory Status: RAM 42.4% (6.49 GB/15.42 GB) | SWAP: 6.4% (1.39 GB/21.91 GB)
+Memory Status: RAM 42.6% (6.02 GB/15.42 GB) | SWAP: 4.3% (2.65 GB/61.91 GB)
 USAGE:
   python concentrator.py [OPTIONS] FILE_OR_DIRECTORY [FILE_OR_DIRECTORY...]
 
@@ -90,8 +91,11 @@ PROCESSING MODE (-p):
   -d, --use-disk         Use disk for large datasets to save RAM
   -ld, --levenshtein-max-dist INT Max Levenshtein distance (default: 2)
 
-GLOBAL OPTIONS:
+OUTPUT OPTIONS:
+  -f, --output-format FORMAT Choose output format: line, expanded (default: line)
   -ob, --output-base-name NAME Base name for output file
+
+GLOBAL OPTIONS:
   -m, --max-length INT    Maximum rule length to process (default: 31)
   --temp-dir DIR        Temporary directory for file mode
   --in-memory           Process entirely in RAM
@@ -107,8 +111,9 @@ EXAMPLES:
   # Generate 50k combinatorial rules
   python concentrator.py -g -n 50000 -l 2 4 hashcat/rules/
 
-  # Process rules interactively with functional minimization
-  python concentrator.py -p -d rules/
+  # Process rules interactively with functional minimization and expanded output
+  python concentrator.py -p -d -f expanded rules/
+
 ```
 
 🧠 **Architecture Overview**
