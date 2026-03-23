@@ -790,20 +790,54 @@ def get_markov_weighted_rules(unique_rules, markov_probabilities, total_transiti
             weighted.append((rule, logp))
     return sorted(weighted, key=lambda x: x[1], reverse=True)
 
-def generate_rules_from_markov_model(markov_probabilities, target, min_len, max_len, gpu_mode=False):
+# ==============================================================================
+# MARKOV GENERATION WITH LEGACY OPERATOR EXCLUSION
+# ==============================================================================
+
+# Operators that are considered legacy or GPU-incompatible and should be avoided in generated rules
+EXCLUDED_MARKOV_OPERATORS = {'4', '6', 'X', 'M', 'Q', '<', '>', '!', '/', '(', ')', '=', '%'}
+
+def generate_rules_from_markov_model(markov_probabilities, target, min_len, max_len, gpu_mode=False,
+                                     excluded_operators: Set[str] = None):
+    """
+    Generate rules using the Markov model, optionally excluding certain operators.
+    :param markov_probabilities: dict of prefix -> dict of next_op -> probability
+    :param target: number of rules to generate
+    :param min_len: minimum rule length
+    :param max_len: maximum rule length
+    :param gpu_mode: whether to use GPU validation
+    :param excluded_operators: set of operators to exclude from generation
+    :return: list of (rule, log_probability) sorted by probability
+    """
     if not memory_intensive_operation_warning("Markov rule generation"):
         return []
+    if excluded_operators is None:
+        excluded_operators = EXCLUDED_MARKOV_OPERATORS
     print_section(f"Generating Markov Rules ({min_len}-{max_len}, Target: {target})")
+    print_info(f"Excluding operators: {', '.join(sorted(excluded_operators))}")
+
     generated = set()
     START = '^'
+
     def get_next(prefix):
         if prefix not in markov_probabilities:
             return None
-        choices = list(markov_probabilities[prefix].keys())
-        weights = list(markov_probabilities[prefix].values())
+        # Filter out excluded operators
+        choices = []
+        weights = []
+        for op, prob in markov_probabilities[prefix].items():
+            if op not in excluded_operators:
+                choices.append(op)
+                weights.append(prob)
         if not choices:
             return None
-        return random.choices(choices, weights=weights, k=1)[0]
+        # Renormalize weights
+        total = sum(weights)
+        if total == 0:
+            return None
+        norm_weights = [w / total for w in weights]
+        return random.choices(choices, weights=norm_weights, k=1)[0]
+
     attempts = target * 5
     for _ in range(attempts):
         if len(generated) >= target:
@@ -823,6 +857,7 @@ def generate_rules_from_markov_model(markov_probabilities, target, min_len, max_
                 break
             rule += nxt
             if min_len <= len(rule) <= max_len:
+                # Validate the rule
                 if gpu_mode:
                     cleaner = HashcatRuleCleaner(2)
                     if cleaner.validate_rule(rule):
@@ -830,9 +865,10 @@ def generate_rules_from_markov_model(markov_probabilities, target, min_len, max_
                 else:
                     if is_valid_hashcat_rule(rule):
                         generated.add(rule)
+
     print_success(f"Generated {len(generated)} valid rules.")
     if generated:
-        dummy_counts = {r:1 for r in generated}
+        dummy_counts = {r: 1 for r in generated}
         weighted = get_markov_weighted_rules(dummy_counts, markov_probabilities, {})
         return weighted[:target]
     return []
