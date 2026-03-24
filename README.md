@@ -230,7 +230,7 @@ python concentrator.py
 
 MIT License. See `LICENSE` for details.
 
-**Credits**
+## Credits
 
 - Penguinkeeper for testing rules
 - https://github.com/0xVavaldi/ruleprocessorY
