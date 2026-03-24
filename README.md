@@ -158,9 +158,12 @@ r}l
 
 **`expanded`** — Each operator and its arguments separated by spaces, one rule per line:
 ```
-$1 c
-u $!
-r } l
+i3l i4e i5y
+l i6p o7i o8e
+D2 i41 o50
+D1 $9 $6 $0
+o6g $1 $5
+D1 i3h i4o
 ```
 
 ---
