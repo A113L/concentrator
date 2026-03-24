@@ -151,9 +151,12 @@ python concentrator.py -p -ld 3 rules/
 
 **`line`** — Standard hashcat rule format, one rule per line:
 ```
-$1c
-u$!
-r}l
+i3li4ei5y
+li6po7io8e
+D2i41o50
+D1$9$6$0
+o6g$1$5
+D1i3hi4o
 ```
 
 **`expanded`** — Each operator and its arguments separated by spaces, one rule per line:
