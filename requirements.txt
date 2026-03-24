@@ -1,0 +1,4 @@
+pyopencl
+numpy
+tqdm
+psutil
