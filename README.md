@@ -158,8 +158,8 @@ r}l
 
 **`expanded`** — Each operator and its arguments separated by spaces, one rule per line:
 ```
-$ 1 c
-u $ !
+$1 c
+u $!
 r } l
 ```
 
