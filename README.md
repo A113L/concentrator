@@ -20,7 +20,7 @@
 ## Requirements
 
 ### Python
-Python 3.7+
+Python 3.8+
 
 ### Core (standard library — no install needed)
 `sys`, `os`, `re`, `argparse`, `math`, `itertools`, `multiprocessing`, `tempfile`, `random`, `datetime`, `threading`, `collections`, `typing`
