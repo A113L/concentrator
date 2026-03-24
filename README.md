@@ -186,12 +186,13 @@ Concentrator validates and simulates the full hashcat rule operator set, includi
 | Rotation | `{` `}` |
 | Trim | `[` `]` `D` `x` `O` |
 | Insert / Overwrite | `i` `o` `^` `$` |
-| Substitute / Delete | `s` `@` `!` |
+| Substitute / Delete | `s` `@` `!` `.` `,` |
 | Extend | `z` `Z` `y` `Y` |
 | Memory | `M` `X` `4` `6` |
 | Arithmetic | `+` `-` `L` `R` |
 | Conditions / Length | `<` `>` `_` `=` `%` |
-| Misc | `:` `e` `E` `k` `K` `Q` `*` |
+| Leet / Replace | `e` `E` `3` |
+| Misc | `:` `k` `K` `Q` `*` |
 
 ---
 
