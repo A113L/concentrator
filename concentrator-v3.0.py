@@ -113,12 +113,12 @@ OPERATOR_ARGS = {
     # Simple (no arguments)
     ':': [], 'l': [], 'u': [], 'c': [], 'C': [], 't': [], 'r': [], 'd': [], 'f': [],
     '{': [], '}': [], '[': [], ']': [], 'q': [], 'M': [], '4': [], '6': [], 'k': [], 'K': [],
-    'Q': [], 'E': [],
+    'Q': [], 'E': [], 'k': [], 'K': [], 'E': [],
 
     # One base-36 number
     'T': ['num'], 'p': ['num'], 'D': ['num'], 'z': ['num'], 'Z': ['num'], "'": ['num'],
     '+': ['num'], '-': ['num'], '.': ['num'], ',': ['num'], 'L': ['num'], 'R': ['num'],
-    'y': ['num'], 'Y': ['num'], '<': ['num'], '>': ['num'], '_': ['num'],
+    'y': ['num'], 'Y': ['num'], '<': ['num'], '>': ['num'], '_': ['num'], '*': ['num', 'num'],
 
     # Two base-36 numbers
     'x': ['num', 'num'], 'O': ['num', 'num'], '*': ['num', 'num'],
@@ -177,7 +177,7 @@ for op, args in OPERATOR_ARGS.items():
     if args:
         OPERATORS_REQUIRING_ARGS[op] = len(args)
 
-ALL_RULE_CHARS = set('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ:,.lu.#()=%!?|~+*-^$sStTiIoOcCrRyYzZeEfFxXdDpPbBqQ`[]><@&vV')
+ALL_RULE_CHARS = set('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ:,.lu.#()=%!?|~+*-^$sStTiIoOcCrRyYzZeEfFxXdDpPbBqQ`[]><@&vV3kK')
 
 # ==============================================================================
 # UTILITY FUNCTIONS
@@ -495,6 +495,143 @@ def Z(x, i):
 FUNCTS['Z'] = Z
 FUNCTS['q'] = lambda x, i: ''.join([a*2 for a in x])
 
+# New operators added for completeness
+def k(x, i):
+    if len(x) >= 2:
+        return x[1] + x[0] + x[2:]
+    return x
+FUNCTS['k'] = k
+
+def K(x, i):
+    if len(x) >= 2:
+        return x[:-2] + x[-1] + x[-2]
+    return x
+FUNCTS['K'] = K
+
+def swap_at(x, i):
+    pos1 = i36(i[0])
+    pos2 = i36(i[1])
+    if pos1 < 0 or pos2 < 0 or pos1 >= len(x) or pos2 >= len(x):
+        return x
+    lst = list(x)
+    lst[pos1], lst[pos2] = lst[pos2], lst[pos1]
+    return ''.join(lst)
+FUNCTS['*'] = swap_at
+
+def bit_shift_left(x, i):
+    pos = i36(i)
+    if pos >= len(x):
+        return x
+    c = x[pos]
+    new_c = chr((ord(c) << 1) & 0xFF)
+    return x[:pos] + new_c + x[pos+1:]
+FUNCTS['L'] = bit_shift_left
+
+def bit_shift_right(x, i):
+    pos = i36(i)
+    if pos >= len(x):
+        return x
+    c = x[pos]
+    new_c = chr((ord(c) >> 1) & 0xFF)
+    return x[:pos] + new_c + x[pos+1:]
+FUNCTS['R'] = bit_shift_right
+
+def inc_ascii(x, i):
+    pos = i36(i)
+    if pos >= len(x):
+        return x
+    c = x[pos]
+    new_c = chr((ord(c) + 1) & 0xFF)
+    return x[:pos] + new_c + x[pos+1:]
+FUNCTS['+'] = inc_ascii
+
+def dec_ascii(x, i):
+    pos = i36(i)
+    if pos >= len(x):
+        return x
+    c = x[pos]
+    new_c = chr((ord(c) - 1) & 0xFF)
+    return x[:pos] + new_c + x[pos+1:]
+FUNCTS['-'] = dec_ascii
+
+def replace_np1(x, i):
+    pos = i36(i)
+    if pos + 1 >= len(x):
+        return x
+    return x[:pos] + x[pos+1] + x[pos+1:]
+FUNCTS['.'] = replace_np1
+
+def replace_nm1(x, i):
+    pos = i36(i)
+    if pos - 1 < 0:
+        return x
+    return x[:pos] + x[pos-1] + x[pos+1:]
+FUNCTS[','] = replace_nm1
+
+def dup_block_front(x, i):
+    n = i36(i)
+    if n <= 0:
+        return x
+    if n > len(x):
+        n = len(x)
+    return x[:n] + x
+FUNCTS['y'] = dup_block_front
+
+def dup_block_back(x, i):
+    n = i36(i)
+    if n <= 0:
+        return x
+    if n > len(x):
+        n = len(x)
+    return x + x[-n:]
+FUNCTS['Y'] = dup_block_back
+
+def title_case(x, i):
+    # lower whole line, then upper first letter and after spaces
+    lowered = x.lower()
+    words = lowered.split(' ')
+    titled = [w[0].upper() + w[1:] if w else '' for w in words]
+    return ' '.join(titled)
+FUNCTS['E'] = title_case
+
+def title_sep(x, i):
+    sep = i
+    parts = x.split(sep)
+    titled = [p[0].upper() + p[1:].lower() if p else '' for p in parts]
+    return sep.join(titled)
+FUNCTS['e'] = title_sep
+
+def toggle_after_nth_sep(x, i):
+    n = i36(i[0])
+    sep = i[1]
+    count = 0
+    pos = -1
+    for idx, ch in enumerate(x):
+        if ch == sep:
+            count += 1
+            if count == n:
+                pos = idx
+                break
+    if pos == -1 or pos + 1 >= len(x):
+        return x
+    # toggle case at pos+1
+    c = x[pos+1]
+    new_c = c.swapcase()
+    return x[:pos+1] + new_c + x[pos+2:]
+FUNCTS['3'] = toggle_after_nth_sep
+
+# Reject rules – treat as identity for functional minimization
+FUNCTS['<'] = lambda x, i: x
+FUNCTS['>'] = lambda x, i: x
+FUNCTS['_'] = lambda x, i: x
+FUNCTS['!'] = lambda x, i: x
+FUNCTS['/'] = lambda x, i: x
+FUNCTS['('] = lambda x, i: x
+FUNCTS[')'] = lambda x, i: x
+FUNCTS['='] = lambda x, i: x
+FUNCTS['%'] = lambda x, i: x
+FUNCTS['Q'] = lambda x, i: x
+
 __memorized__ = ['']
 
 def extract_memory(string, args):
@@ -583,7 +720,8 @@ __kernel void validate_rules_batch(
               c == 'F' || c == 'x' || c == 'X' || c == 'd' || c == 'D' ||
               c == 'p' || c == 'P' || c == 'b' || c == 'B' || c == 'q' ||
               c == 'Q' || c == '`' || c == '[' || c == ']' || c == '>' ||
-              c == '<' || c == '@' || c == '&' || c == 'v' || c == 'V')) {
+              c == '<' || c == '@' || c == '&' || c == 'v' || c == 'V' ||
+              c == 'k' || c == 'K' || c == 'L' || c == 'R' || c == '3')) {
             valid = false;
             break;
         }
@@ -1301,6 +1439,8 @@ class HashcatRuleCleaner:
     RULE_OP_MANGLE_DUPEBLOCK_LAST   = 'Y'
     RULE_OP_MANGLE_TITLE            = 'E'
     RULE_OP_MANGLE_TITLE_SEP        = 'e'
+    RULE_OP_MANGLE_TOGGLE_NTH_SEP   = '3'
+    RULE_OP_REJECT_LEN_NOT_EQ       = '_'
 
     MAX_CPU_RULES = 255
     MAX_GPU_RULES = 255
@@ -1341,7 +1481,8 @@ class HashcatRuleCleaner:
             self.RULE_OP_REJECT_EQUAL_LAST,
             self.RULE_OP_REJECT_EQUAL_AT,
             self.RULE_OP_REJECT_CONTAINS,
-            self.RULE_OP_REJECT_MEMORY
+            self.RULE_OP_REJECT_MEMORY,
+            self.RULE_OP_REJECT_LEN_NOT_EQ
         }
         return op in gpu_denied_ops
 
@@ -1505,6 +1646,19 @@ class HashcatRuleCleaner:
                 elif op == self.RULE_OP_MANGLE_TITLE_SEP:
                     pos += 1
                     if pos >= line_len:
+                        rc = -1
+                elif op == self.RULE_OP_MANGLE_TOGGLE_NTH_SEP:
+                    pos += 1
+                    if pos >= line_len or self.conv_ctoi(clean_line[pos]) == -1:
+                        rc = -1
+                    pos += 1
+                    if pos >= line_len:
+                        rc = -1
+                elif op == self.RULE_OP_REJECT_LEN_NOT_EQ:
+                    pos += 1
+                    if pos >= line_len or self.conv_ctoi(clean_line[pos]) == -1:
+                        rc = -1
+                    if self.mode == 2:
                         rc = -1
                 elif op == self.RULE_OP_MANGLE_EXTRACT_MEMORY:
                     pos += 1
