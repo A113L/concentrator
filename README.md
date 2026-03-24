@@ -1,154 +1,234 @@
-**Concentrator v3.0: Unified Hashcat Rule Processor**
+# CONCENTRATOR v3.0
 
-Concentrator v3.0 is an advanced, high-performance tool written in Python 3 designed to unify the processes of extracting, validating, cleaning, and generating highly effective Hashcat rulesets. It features multi-processing for parallel file ingestion and optional OpenCL (GPU) acceleration for massive-scale rule validation and filtering.
+> **Unified Hashcat Rule Processor** — Extract, generate, and process hashcat password rules with GPU acceleration, Markov chain modeling, and functional minimization.
 
-✨ **Key Features**
+---
 
-- Three Processing Modes: Extract top-performing rules, generate combinatorial rule sets, or generate Markov-chain based rules.
+## Features
 
-- OpenCL Acceleration: Optional GPU-backed processing for rule validation, providing significant speed improvements over CPU-only methods for large datasets.
+- **OpenCL GPU Acceleration** — Batch rule validation offloaded to GPU for high throughput
+- **Three Processing Modes** — Extraction, Combinatorial generation, and Markov-based generation
+- **Hashcat Rule Engine Simulation** — Full CPU-side implementation of hashcat's rule operators
+- **Functional Minimization** — Deduplicate rules that produce identical outputs
+- **Levenshtein Distance Filtering** — Remove near-duplicate rules by edit distance
+- **Memory Safety** — Monitors RAM/swap usage with configurable thresholds and disk-spill mode
+- **Multiple Output Formats** — `line` (compact) or `expanded` (operator + args separated by spaces)
+- **Interactive & CLI Modes** — Guided wizard or full argument-driven usage
 
-- Hashcat Engine Simulation: Includes a built-in Python simulation of the Hashcat rule engine for functional testing and minimization (preventing functionally duplicate rules).
+---
 
-- Memory Safety: Features proactive memory usage monitoring (psutil) to warn users before performing memory-intensive operations, preventing system instability.
+## Requirements
 
-- Advanced Filtering: Supports complex cleanup and deduplication strategies post-generation, including Levenshtein distance filtering.
+### Python
+Python 3.7+
 
-- Interactive and CLI Modes: Supports full command-line arguments as well as a user-friendly, colorized interactive setup mode.
+### Core (standard library — no install needed)
+`sys`, `os`, `re`, `argparse`, `math`, `itertools`, `multiprocessing`, `tempfile`, `random`, `datetime`, `threading`, `collections`, `typing`
 
-🚀 **Getting Started**
+### Optional (install for full functionality)
 
-Prerequisites
+| Package | Purpose | Install |
+|---|---|---|
+| `pyopencl` | GPU-accelerated rule validation | `pip install pyopencl` |
+| `numpy` | Array operations for GPU buffers | `pip install numpy` |
+| `tqdm` | Progress bars | `pip install tqdm` |
+| `psutil` | RAM/swap monitoring | `pip install psutil` |
 
-Concentrator v3.0 requires Python 3.8 or higher. For full functionality, including GPU acceleration and advanced monitoring, the following dependencies are required.
+> All optional packages degrade gracefully — the tool runs on pure Python if none are installed.
 
-We recommend installing them within a virtual environment:
+---
 
-```# Setup virtual environment
-python3 -m venv venv
-source venv/bin/activate
+## Installation
 
-# Install core dependencies
-pip install tqdm psutil numpy
-
-# Install OpenCL dependencies (Note: pyopencl installation may require system-level OpenCL drivers)
-pip install pyopencl
-```
-
-
-***Installation***
-
-Clone the repository and run the script directly:
-
-```
-git clone https://github.com/A113L/concentrator.git
+```bash
+git clone https://github.com/youruser/concentrator.git
 cd concentrator
-python3 concentrator-v3.py --help
+pip install pyopencl numpy tqdm psutil   # optional but recommended
 ```
 
-⚙️ **Usage**
+---
 
-```
-python concentrator-v3.py -h
+## Usage
 
-================================================================================
-          CONCENTRATOR v3.0 - Unified Hashcat Rule Processor
-================================================================================
-Combined Features:
-  • OpenCL GPU Acceleration for validation and generation
-  • Three Processing Modes: Extraction, Combinatorial, Markov
-  • Hashcat Rule Engine Simulation & Functional Minimization
-  • Rule Validation and Cleanup (CPU/GPU compatible)
-  • Levenshtein Distance Filtering
-  • Smart Processing Selection & Memory Safety
-  • Interactive & CLI Modes with Colorized Output
-  • Multiple output formats: line, expanded
-================================================================================
-
-Memory Status: RAM 42.6% (6.02 GB/15.42 GB) | SWAP: 4.3% (2.65 GB/61.91 GB)
-USAGE:
-  python concentrator.py [OPTIONS] FILE_OR_DIRECTORY [FILE_OR_DIRECTORY...]
-
-MODES (choose one):
-  -e, --extract-rules     Extract top existing rules from input files
-  -g, --generate-combo    Generate combinatorial rules from top operators
-  -gm, --generate-markov-rules Generate statistically probable Markov rules
-  -p, --process-rules     Interactive rule processing and minimization
-
-EXTRACTION MODE (-e):
-  -t, --top-rules INT     Number of top rules to extract (default: 10000)
-  -s, --statistical-sort  Sort by statistical weight instead of frequency
-
-COMBINATORIAL MODE (-g):
-  -n, --combo-target INT  Target number of rules (default: 100000)
-  -l, --combo-length MIN MAX Rule length range (default: 1 3)
-
-MARKOV MODE (-gm):
-  -gt, --generate-target INT Target rules (default: 10000)
-  -ml, --markov-length MIN MAX Rule length range (default: 1 3)
-
-PROCESSING MODE (-p):
-  -d, --use-disk         Use disk for large datasets to save RAM
-  -ld, --levenshtein-max-dist INT Max Levenshtein distance (default: 2)
-
-OUTPUT OPTIONS:
-  -f, --output-format FORMAT Choose output format: line, expanded (default: line)
-  -ob, --output-base-name NAME Base name for output file
-
-GLOBAL OPTIONS:
-  -m, --max-length INT    Maximum rule length to process (default: 31)
-  --temp-dir DIR        Temporary directory for file mode
-  --in-memory           Process entirely in RAM
-  --no-gpu             Disable GPU acceleration
-
-INTERACTIVE MODE:
-  python concentrator.py   (run without arguments for interactive mode)
-
-EXAMPLES:
-  # Extract top 5000 rules with GPU acceleration
-  python concentrator.py -e -t 5000 --no-gpu rules/*.rule
-
-  # Generate 50k combinatorial rules
-  python concentrator.py -g -n 50000 -l 2 4 hashcat/rules/
-
-  # Process rules interactively with functional minimization and expanded output
-  python concentrator.py -p -d -f expanded rules/
-
+### Interactive Mode
+Run without arguments to launch the guided wizard:
+```bash
+python concentrator.py
 ```
 
-🧠 **Architecture Overview**
+### CLI Mode
 
-The Concentrator system operates in several key phases:
+```
+python concentrator.py [OPTIONS] FILE_OR_DIRECTORY [FILE_OR_DIRECTORY ...]
+```
 
-**File Ingestion:** Input paths are recursively searched, and files are streamed or read into memory (depending on the --in-memory flag).
+One mode flag is **required**.
 
-**Preprocessing & Validation:** Initial rules are filtered for basic Hashcat syntax using multi-processing.
+---
 
-**Generation/Extraction:** The selected mode (Extraction, Combo, or Markov) generates a massive candidate set of rules.
+## Modes
 
-**Functional Minimization:** Candidates are passed through the Python-implemented RuleEngine to ensure they produce unique output for common test strings, reducing redundancy.
+### `-e` / `--extract-rules` — Extraction Mode
+Extract the most frequent (or statistically weighted) rules from existing rule files.
 
-**GPU Validation (Optional):** If OpenCL is enabled, the final candidate rules are batched and sent to the GPU for highly optimized validation against character set constraints and length limits.
+```bash
+# Extract top 5000 rules by frequency
+python concentrator.py -e -t 5000 rules/
 
-**Final Output:** Cleaned, unique, and validated rules are written to the output file.
+# Extract top 10000 rules sorted by Markov sequence probability
+python concentrator.py -e -t 10000 -s rules/*.rule
+```
 
-⚠️ **Memory and Safety**
+| Flag | Default | Description |
+|---|---|---|
+| `-t`, `--top-rules` | `10000` | Number of top rules to extract |
+| `-s`, `--statistical-sort` | off | Sort by Markov probability instead of raw frequency |
 
-The tool is designed to handle very large rule files (billions of rules). It includes a robust memory monitoring system (check_memory_safety and memory_intensive_operation_warning) that leverages psutil. If RAM + Swap usage exceeds a safety threshold (default 85%) before a major operation (like functional minimization), the user is warned and asked to confirm continuation to prevent system lockups.
+---
 
-🛠️**OpenCL Integration**
+### `-g` / `--generate-combo` — Combinatorial Mode
+Generate rules by exhaustively combining the most common operators up to a target count.
 
-The OpenCL portion requires pyopencl and is currently implemented for the final-stage validation (validate_rules_batch kernel). This offloads basic rule integrity checks to the GPU, making the overall process highly scalable. Ensure your system has the correct vendor drivers (NVIDIA, AMD, or Intel) installed for OpenCL support.
+```bash
+# Generate 50k rules using operator combinations of length 2–4
+python concentrator.py -g -n 50000 -l 2 4 hashcat/rules/
+```
 
-📝 License
+| Flag | Default | Description |
+|---|---|---|
+| `-n`, `--combo-target` | `100000` | Target number of rules to generate |
+| `-l`, `--combo-length` | `1 3` | Min and max operator-chain length |
 
-Distributed under the MIT License. See LICENSE for more information.
+---
 
-**Website**
+### `-gm` / `--generate-markov-rules` — Markov Mode
+Generate statistically probable rules using a Markov chain model trained on the input rule files.
 
-https://hcrt.pages.dev/concentrator.static_workflow
+```bash
+# Generate 10k Markov rules of length 1–5
+python concentrator.py -gm -gt 10000 -ml 1 5 hashcat/rules/
+```
 
-[![concentrator1.png](https://i.postimg.cc/dtmTPxmJ/concentrator1.png)](https://postimg.cc/nCrLqTPW)
+| Flag | Default | Description |
+|---|---|---|
+| `-gt`, `--generate-target` | `10000` | Target number of rules to generate |
+| `-ml`, `--markov-length` | `1 3` | Min and max rule length |
+
+---
+
+### `-p` / `--process-rules` — Processing Mode
+Load, validate, deduplicate, and functionally minimize existing rule sets interactively.
+
+```bash
+# Process rules using disk mode to avoid RAM exhaustion
+python concentrator.py -p -d rules/
+
+# Process with Levenshtein distance filtering (max dist 3)
+python concentrator.py -p -ld 3 rules/
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-d`, `--use-disk` | off | Spill to disk instead of keeping everything in RAM |
+| `-ld`, `--levenshtein-max-dist` | `2` | Max edit distance for near-duplicate filtering |
+
+---
+
+## Global Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `-ob`, `--output-base-name` | `concentrator_output` | Base filename for output (no extension) |
+| `-f`, `--output-format` | `line` | Output format: `line` or `expanded` |
+| `-m`, `--max-length` | `31` | Maximum rule token length to process |
+| `--temp-dir` | system default | Directory to write temporary files |
+| `--in-memory` | off | Process entirely in RAM (overrides disk mode) |
+| `--no-gpu` | off | Disable OpenCL GPU acceleration |
+
+---
+
+## Output Formats
+
+**`line`** — Standard hashcat rule format, one rule per line:
+```
+$1c
+u$!
+r}l
+```
+
+**`expanded`** — Each operator and its arguments separated by spaces, one rule per line:
+```
+$ 1 c
+u $ !
+r } l
+```
+
+---
+
+## Input Files
+
+Concentrator recursively scans directories up to **3 levels deep** for files with these extensions:
+
+`.rule` `.rules` `.hr` `.hashcat` `.txt` `.lst`
+
+You can pass individual files, directories, or a mix of both.
+
+---
+
+## Supported Hashcat Rule Operators
+
+Concentrator validates and simulates the full hashcat rule operator set, including:
+
+| Category | Operators |
+|---|---|
+| Case | `l` `u` `c` `C` `t` `T` |
+| Reverse / Duplicate | `r` `d` `f` `p` `q` |
+| Rotation | `{` `}` |
+| Trim | `[` `]` `D` `x` `O` |
+| Insert / Overwrite | `i` `o` `^` `$` |
+| Substitute / Delete | `s` `@` `!` |
+| Extend | `z` `Z` `y` `Y` |
+| Memory | `M` `X` `4` `6` |
+| Arithmetic | `+` `-` `L` `R` |
+| Conditions / Length | `<` `>` `_` `=` `%` |
+| Misc | `:` `e` `E` `k` `K` `Q` `*` |
+
+---
+
+## Examples
+
+```bash
+# Extract top 5000 rules (GPU off) from a glob
+python concentrator.py -e -t 5000 --no-gpu rules/*.rule
+
+# Generate 100k combinatorial rules, output in expanded format
+python concentrator.py -g -n 100000 -l 1 3 -f expanded hashcat/rules/ -ob my_rules
+
+# Markov generation with custom length range
+python concentrator.py -gm -gt 20000 -ml 2 4 hashcat/rules/
+
+# Process and minimize rules, writing temp files to /tmp/scratch
+python concentrator.py -p -d --temp-dir /tmp/scratch rules/
+
+# Interactive mode
+python concentrator.py
+```
+
+---
+
+## Memory Considerations
+
+- At startup, Concentrator prints current RAM and swap usage.
+- If RAM usage exceeds **85%**, a warning is raised and you are prompted before continuing.
+- Use `--use-disk` / `-d` with `-p` mode to spill intermediate data to disk.
+- Use `--in-memory` to force full in-RAM processing (fastest, but watch your available memory).
+- Install `psutil` to enable memory monitoring.
+
+---
+
+## License
+
+MIT License. See `LICENSE` for details.
 
 **Credits**
 
