@@ -1057,7 +1057,30 @@ def generate_rules_parallel(top_operators, min_len, max_len, gpu_mode=False):
 # FUNCTIONAL MINIMIZATION
 # ==============================================================================
 
-TEST_VECTOR = ["Password", "123456", "ADMIN", "1aB", "QWERTY", "longword", "spec!", "!spec", "a", "b", "c", "0123", "xYz!", "TEST", "tEST", "test", "0", "1", "$^", "lorem", "ipsum"]
+# Modified test vector with words of 10+ characters to avoid false positives from rules like x, O, ' etc.
+TEST_VECTOR = [
+    "Password1234",
+    "1234567890",
+    "Administrator",
+    "1aBcDeFgHiJ",
+    "QWERTYUIOPAS",
+    "longwordtest",
+    "special!@#$%",
+    "!spec123456",
+    "aBcDeFgHiJkL",
+    "bBcDeFgHiJkL",
+    "cCDeFgHiJkLm",
+    "0123456789AB",
+    "xYzAbCdEfGh",
+    "TESTWORD123",
+    "tESTword456",
+    "testWORD789",
+    "0000000000",
+    "1111111111",
+    "$^&*()_+=-",
+    "loremipsumdo",
+    "ipsumloremdo"
+]
 
 def worker_generate_signature(rule_data):
     rule_text, count = rule_data
