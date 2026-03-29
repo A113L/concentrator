@@ -1,4 +1,4 @@
-# CONCENTRATOR v3.0
+# CONCENTRATOR v3.1
 
 > **Unified Hashcat Rule Processor** — Extract, generate, and process hashcat password rules with GPU acceleration, Markov chain modeling, and functional minimization.
 
