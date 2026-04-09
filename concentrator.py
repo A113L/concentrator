@@ -1,6 +1,29 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from __future__ import annotations  # Python 3.8+ type-hint compatibility
 """
-CONCENTRATOR v3.1 - Unified Hashcat Rule Processor
+CONCENTRATOR v3.2 - Unified Hashcat Rule Processor
+
+Changes from v3.1 → v3.2
+─────────────────────────
+1. Full-token analysis (process_single_file)
+   Operator counting now uses TOKEN_REGEX.findall so that each full token
+   (e.g. '$5', 'sae', 'T3') is counted as one atomic unit instead of
+   counting the operator byte and its argument bytes independently.
+   This means find_min_operators_for_target works on the correct token pool
+   and combinatorial counts accurately reflect producible rule-chains.
+
+2. Round-trip re-parse validation gate (_generate_for_length)
+   After joining a token combination into a rule string, the string is
+   re-tokenised with TOKEN_REGEX.  The result must equal the original token
+   list exactly.  This catches any case where two adjacent tokens accidentally
+   merge into a different longer operator at the string boundary.
+   Any combination that fails this round-trip check is silently dropped.
+
+3. Python 3.8+ compatibility
+   Added `from __future__ import annotations` so that PEP-604 / PEP-585
+   style hints (list[str], dict[str, int] …) work on Python 3.8 and 3.9
+   without raising TypeError at import time.
 
 Changes from v3.0 → v3.1
 ─────────────────────────
@@ -195,22 +218,6 @@ ALL_RULE_CHARS = set(
 # ---------------------------------------------------------------------------
 # NEVER_PRODUCE_OPS  (v3.1)
 # ---------------------------------------------------------------------------
-# Operators that must NEVER appear in any rule that is loaded, generated,
-# or saved by Concentrator — regardless of CPU/GPU mode.
-#
-#   Memory operators : M  4  6  X
-#     These depend on inter-rule "memorized" state.  Their presence in a
-#     stand-alone rule almost always produces unexpected/wrong results and
-#     they make deduplication unreliable.
-#
-#   Reject operators : <  >  !  /  (  )  =  %  Q
-#     These cause hashcat to REJECT a candidate password rather than
-#     transform it.  They serve a different semantic purpose and must not
-#     be mixed into transformation rule sets.
-#
-# This single constant replaces v3.0's _GPU_DENIED_OPS and
-# EXCLUDED_MARKOV_OPERATORS (both had the same content).
-# ---------------------------------------------------------------------------
 NEVER_PRODUCE_OPS: Set[str] = frozenset({'M', '4', '6', 'X', '<', '>', '!', '/', '(', ')', '=', '%', 'Q'})
 
 
@@ -251,7 +258,7 @@ OPERATORS_REQUIRING_ARGS: Dict[str, int] = {
 
 def print_banner() -> None:
     print(f"\n{Colors.CYAN}{Colors.BOLD}" + "=" * 80)
-    print("          CONCENTRATOR v3.1 - Unified Hashcat Rule Processor")
+    print("          CONCENTRATOR v3.2 - Unified Hashcat Rule Processor")
     print("=" * 80 + f"{Colors.END}")
     features = [
         "OpenCL GPU Acceleration for validation and generation",
@@ -634,6 +641,10 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
 
     v3.1: rules containing any operator from NEVER_PRODUCE_OPS are silently
     dropped at this stage so they never enter the processing pipeline.
+
+    v3.2: operator counting now uses TOKEN_REGEX.findall so that full tokens
+    (e.g. '$5', 'sae', 'T3') are counted as atomic units instead of counting
+    the operator character and its argument bytes separately.
     """
     operator_counts:  Dict[str, int] = defaultdict(int)
     full_rule_counts: Dict[str, int] = defaultdict(int)
@@ -655,8 +666,9 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
                 # --------------------------------------------------------------
                 full_rule_counts[clean] += 1
                 clean_rules.append(clean)
-                for m in OPERATOR_REGEX.finditer(clean):
-                    operator_counts[m.group(0)] += 1
+                # v3.2: count full tokens (e.g. '$5', 'sae') not bare op chars
+                for token in TOKEN_REGEX.findall(clean):
+                    operator_counts[token] += 1
 
         if not STATE.in_memory_mode:
             with tempfile.NamedTemporaryFile(
@@ -813,8 +825,7 @@ def generate_rules_from_markov_model(
 ) -> List[Tuple[str, float]]:
     """Generate *target* valid hashcat rules via a Markov walk.
 
-    v3.1: excluded_operators defaults to NEVER_PRODUCE_OPS (was a separate
-    EXCLUDED_MARKOV_OPERATORS constant that duplicated _GPU_DENIED_OPS).
+    v3.1: excluded_operators defaults to NEVER_PRODUCE_OPS.
     """
     if not memory_intensive_operation_warning("Markov rule generation"):
         return []
@@ -883,9 +894,9 @@ def find_min_operators_for_target(
 ) -> List[str]:
     """Return the fewest top operators whose cartesian product covers *target* rules.
 
-    v3.1: operators from NEVER_PRODUCE_OPS are excluded from the candidate pool
-    before the combinatorial count is computed, so they can never end up in the
-    generated rule set.
+    v3.1: operators from NEVER_PRODUCE_OPS are excluded from the candidate pool.
+    v3.2: sorted_operators now contains full tokens (e.g. '$5', 'sae') so the
+    count accurately reflects how many distinct rule-chains are producible.
     """
     # Strip banned operators from the candidate pool at the source
     safe_operators = [(op, cnt) for op, cnt in sorted_operators if op not in NEVER_PRODUCE_OPS]
@@ -902,12 +913,24 @@ def find_min_operators_for_target(
 def _generate_for_length(args: Tuple) -> Set[str]:
     top_ops, length, gpu_mode = args
     generated: Set[str] = set()
+    invalid_concat = 0
     for combo in itertools.product(top_ops, repeat=length):
         rule = ''.join(combo)
         # Paranoia check: never emit a rule with a banned operator
         if _has_banned_op(rule):
             continue
         if not is_valid_hashcat_rule(rule):
+            continue
+        # Round-trip re-parse gate (v3.2):
+        # After joining tokens into a rule string, re-tokenise it.  The
+        # result must equal the original token list exactly.  This catches
+        # cases where two adjacent tokens accidentally merge into a different
+        # longer operator — e.g. token 's' followed by 'a' followed by 'b'
+        # must re-parse back as exactly ['s','a','b'] not ['sab'].
+        # Any ambiguous concatenation is silently dropped.
+        reparsed = TOKEN_REGEX.findall(rule)
+        if reparsed != list(combo):
+            invalid_concat += 1
             continue
         if gpu_mode:
             if not HashcatRuleCleaner(2).validate_rule(rule):
@@ -951,12 +974,6 @@ def _i36(s: str) -> int:
 class RuleEngine:
     """
     Simulates hashcat's rule application on a test string.
-
-    Key design decisions vs v3.0:
-      - `memorized` state is an instance variable, not a module-level list, so
-        multiple engines in the same process cannot corrupt each other.
-      - `apply()` correctly chains multiple rules sequentially (v3.0 returned
-        after the first rule due to an errant `return` inside the for-loop).
     """
 
     def __init__(self, rules: List[str]) -> None:
@@ -975,14 +992,10 @@ class RuleEngine:
                     pass
         return word
 
-    # ------------------------------------------------------------------
-    # Internal dispatch
-    # ------------------------------------------------------------------
     def _dispatch(self, token: str, word: str) -> str:
         op   = token[0]
         args = token[1:]
 
-        # Replace match/case with if/elif for Python 3.9 compatibility
         if op == ':':
             return word
         elif op == 'l':
@@ -1134,24 +1147,6 @@ class RuleEngine:
 # FUNCTIONAL MINIMIZATION
 # ==============================================================================
 
-# ---------------------------------------------------------------------------
-# TEST_VECTOR  (v3.1 — expanded from 21 to 52 words)
-#
-# Why the expansion matters:
-#   The minimizer groups rules by their functional signature = the joined
-#   outputs when each rule is applied to every word in TEST_VECTOR.
-#   With only 21 short words (max length ≈ 8) all position-specific operators
-#   targeting position ≥ 9 (e.g. D9, iAx, OBC …) returned unchanged strings
-#   for every test word → they shared a signature with ':' (no-op) and each
-#   other → they were incorrectly merged and dropped.
-#
-#   The new vector covers:
-#     • lengths 1-32  → exercises every base-36 position operand 0-V
-#     • all-lowercase, all-uppercase, digit-only, mixed-case
-#     • strings with special characters, underscore, hyphen, space
-#   This drastically increases the signature space and makes false-positive
-#   collisions far less likely.
-# ---------------------------------------------------------------------------
 TEST_VECTOR: List[str] = [
     # Length 1-4
     "a", "Z", "1", "aB", "42", "ab", "AB", "0",
@@ -1187,8 +1182,6 @@ TEST_VECTOR: List[str] = [
     "aaaa", "ZZZZ", "1111",
 ]
 
-# Module-level variable populated by the pool initializer so each worker
-# process builds it once instead of once per rule.
 _worker_test_vector: List[str] = []
 
 
@@ -1199,13 +1192,6 @@ def _worker_init(test_vec: List[str]) -> None:
 
 
 def _compute_signature(rule_data: Tuple[str, int]) -> Tuple[str, Tuple[str, int]]:
-    """
-    Worker function: apply *rule_text* to every word in the shared test vector
-    and return the pipe-joined output as the rule's functional signature.
-
-    By using a pool initializer we avoid passing TEST_VECTOR through the IPC
-    pipe on every single call.
-    """
     rule_text, count = rule_data
     engine    = RuleEngine([rule_text])
     outputs   = [engine.apply(w) for w in _worker_test_vector]
@@ -1217,23 +1203,6 @@ def _compute_signature(rule_data: Tuple[str, int]) -> Tuple[str, Tuple[str, int]
 def functional_minimization(
     data: List[Tuple[str, int]]
 ) -> List[Tuple[str, int]]:
-    """
-    Deduplicate rules that produce identical output across a diverse test vector.
-
-    For each equivalence class only the highest-frequency representative is
-    kept; its count is the *sum* of counts across all equivalent rules.
-
-    v3.1 improvements:
-      - TEST_VECTOR expanded to 52 words (from 21) to reduce false-positive
-        collisions among position-sensitive operators.
-      - Pool initializer: TEST_VECTOR transferred once per worker, not once
-        per rule call.
-      - imap_unordered: worker results are collected as soon as they arrive
-        rather than waiting for each chunk to complete sequentially.
-      - Auto chunksize: balances IPC overhead against granularity.
-      - RuleEngine.memorized is instance state so worker engines don't
-        accidentally share memorized state.
-    """
     print_section("Functional Minimization")
     print_warning("RAM intensive — may take significant time for large datasets.")
 
@@ -1273,7 +1242,7 @@ def functional_minimization(
 
     final: List[Tuple[str, int]] = []
     for group in signature_map.values():
-        group.sort(key=lambda kv: kv[1], reverse=True)          # best representative first
+        group.sort(key=lambda kv: kv[1], reverse=True)
         best_rule = group[0][0]
         total_cnt = sum(cnt for _, cnt in group)
         final.append((best_rule, total_cnt))
@@ -1289,11 +1258,6 @@ def functional_minimization(
 # ==============================================================================
 
 def levenshtein_distance(s1: str, s2: str, max_dist: Optional[int] = None) -> int:
-    """
-    Classic O(|s1|·|s2|) DP with an early-exit optimisation:
-    if *max_dist* is given, abort as soon as the minimum possible distance
-    exceeds it (saves the inner loop for clearly dissimilar strings).
-    """
     if len(s1) < len(s2):
         s1, s2 = s2, s1
     if not s2:
@@ -1308,8 +1272,6 @@ def levenshtein_distance(s1: str, s2: str, max_dist: Optional[int] = None) -> in
             cur.append(val)
             if val < row_min:
                 row_min = val
-        # Early-exit: if the best achievable edit distance for this row
-        # already exceeds max_dist, no need to continue.
         if max_dist is not None and row_min > max_dist:
             return row_min
         prev = cur
@@ -1540,14 +1502,12 @@ def save_rules(
     Unified rule-save function.
 
     v3.1: final safety-net pass that strips any rule still containing a
-    NEVER_PRODUCE_OP before writing to disk, so the guarantee holds even if
-    a caller somehow bypassed the earlier pipeline filters.
+    NEVER_PRODUCE_OP before writing to disk.
     """
     if not data:
         print_error("No rules to save!")
         return False
 
-    # Final safety-net: drop any rule that slipped through earlier filters
     def _extract_rule(item) -> str:
         return item[0] if isinstance(item, tuple) else item
 
@@ -1565,7 +1525,7 @@ def save_rules(
 
     try:
         with open(filename, 'w', encoding='utf-8') as fh:
-            fh.write(f"# CONCENTRATOR v3.1 – {mode_name.upper()} MODE OUTPUT\n")
+            fh.write(f"# CONCENTRATOR v3.2 – {mode_name.upper()} MODE OUTPUT\n")
             fh.write(f"# Generated:   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             fh.write(f"# Total rules: {len(clean_data):,}\n")
             fh.write(f"# Format:      {STATE.output_format}\n#\n")
@@ -1584,44 +1544,25 @@ def save_rules(
 # HASHCAT RULE CLEANUP — data-driven validator
 # ==============================================================================
 
-# Each entry: op → list of arg kinds required
-#   'N'  = next char must be a valid base-36 digit (conv_ctoi ≥ 0)
-#   'C'  = next char can be any printable (just needs to exist)
 _OP_VALIDATION_SPEC: Dict[str, List[str]] = {
-    # Zero-arg ops
     ':': [], 'l': [], 'u': [], 'c': [], 'C': [], 't': [], 'r': [], 'd': [], 'f': [],
     '{': [], '}': [], '[': [], ']': [], 'q': [], 'k': [], 'K': [], 'a': [], 'E': [],
-    # One base-36 num
     'T': ['N'], 'p': ['N'], 'D': ['N'], 'z': ['N'], 'Z': ['N'], "'": ['N'],
     'L': ['N'], 'R': ['N'], '+': ['N'], '-': ['N'], '.': ['N'], ',': ['N'],
     'y': ['N'], 'Y': ['N'], '_': ['N'],
-    # Two base-36 nums
     'x': ['N', 'N'], 'O': ['N', 'N'], '*': ['N', 'N'],
-    # One arbitrary char
     '$': ['C'], '^': ['C'], '@': ['C'], 'e': ['C'],
-    # Two arbitrary chars
     's': ['C', 'C'],
-    # One base-36 + one char  (= and % are reject ops → NEVER_PRODUCE_OPS → omitted)
     'i': ['N', 'C'], 'o': ['N', 'C'], '3': ['N', 'C'],
-    # Memory/reject ops (NEVER_PRODUCE_OPS): intentionally ABSENT from this
-    # spec so that validate_rule() always returns False for them via the
-    # 'unknown operator' early-return.
-    # M  4  6  X  Q  <  >  !  /  (  )  =  %
-    # Their syntax entries are deliberately omitted.
 }
-
-# Note: _GPU_DENIED_OPS has been removed in v3.1.
-# NEVER_PRODUCE_OPS is the single authoritative source of truth.
 
 
 class HashcatRuleCleaner:
     """
     Validates hashcat rules against CPU or GPU compatibility constraints.
 
-    v3.1 change: NEVER_PRODUCE_OPS operators are always rejected, even in
-    CPU mode (mode=1).  Previously they were only blocked in GPU mode (mode=2)
-    via _GPU_DENIED_OPS.  The _OP_VALIDATION_SPEC table no longer has entries
-    for those operators, so the 'unknown operator' early-return handles them.
+    v3.1: NEVER_PRODUCE_OPS operators are always rejected.
+    The _OP_VALIDATION_SPEC table no longer has entries for those operators.
     """
 
     MAX_RULES = 255
@@ -1633,7 +1574,6 @@ class HashcatRuleCleaner:
 
     @staticmethod
     def _conv_ctoi(c: str) -> int:
-        """Return numeric value of a base-36 digit, or -1 if invalid."""
         if '0' <= c <= '9':
             return ord(c) - ord('0')
         if 'A' <= c <= 'Z':
@@ -1641,17 +1581,6 @@ class HashcatRuleCleaner:
         return -1
 
     def validate_rule(self, rule_line: str) -> bool:
-        """
-        Return True iff *rule_line* is valid for the configured mode.
-
-        Uses _OP_VALIDATION_SPEC for argument counting so the logic is
-        O(rule_length) with no branching per operator.
-
-        v3.1: NEVER_PRODUCE_OPS operators are absent from _OP_VALIDATION_SPEC,
-        so they hit the 'unknown operator' path and return False unconditionally,
-        regardless of mode.  The explicit GPU-mode check has been removed; the
-        table-driven approach is self-consistent.
-        """
         clean = rule_line.replace(' ', '')
         if not clean:
             return False
@@ -1664,7 +1593,7 @@ class HashcatRuleCleaner:
             op = clean[pos]
 
             if op not in _OP_VALIDATION_SPEC:
-                return False  # unknown operator (includes all NEVER_PRODUCE_OPS)
+                return False
 
             spec = _OP_VALIDATION_SPEC[op]
             for kind in spec:
@@ -1673,7 +1602,6 @@ class HashcatRuleCleaner:
                     return False
                 if kind == 'N' and self._conv_ctoi(clean[pos]) == -1:
                     return False
-                # kind == 'C': any character is valid, just needs to exist (checked above)
 
             cnt += 1
             pos += 1
@@ -1712,7 +1640,6 @@ def gpu_extract_and_validate_rules(
     gpu_enabled:      bool,
 ) -> List[Tuple[str, int]]:
     sorted_rules = sorted(full_rule_counts.items(), key=lambda kv: kv[1], reverse=True)
-    # v3.1: pre-filter banned ops before GPU/CPU validation
     candidates = [r for r, _ in sorted_rules[:top_rules * 2] if not _has_banned_op(r)]
 
     if gpu_enabled:
@@ -1767,7 +1694,7 @@ def enhanced_interactive_processing_loop(
             choice = input(f"{Colors.YELLOW}Enter choice: {Colors.RESET}").strip().lower()
 
             if choice == 'q':
-                print_header("THANK YOU FOR USING CONCENTRATOR v3.1!")
+                print_header("THANK YOU FOR USING CONCENTRATOR v3.2!")
                 break
 
             elif choice == 'p':
@@ -1950,7 +1877,6 @@ def concentrator_main_processing(args: Any) -> None:
         print_error("No operators found. Exiting.")
         return
 
-    # ---- Markov model (built only when needed) ----
     markov_probs, markov_totals = None, None
     needs_markov = (
         active_mode == 'markov'
@@ -1962,7 +1888,6 @@ def concentrator_main_processing(args: Any) -> None:
     else:
         print_info("Skipping Markov model (not needed for this mode).")
 
-    # ---- Mode-specific result computation ----
     result_data: List[Tuple] = []
 
     if active_mode == 'extraction':
@@ -2014,14 +1939,12 @@ def concentrator_main_processing(args: Any) -> None:
 
     elif active_mode == 'combo':
         print_section("Combinatorial Rule Generation")
-        # find_min_operators_for_target already strips NEVER_PRODUCE_OPS
         top_ops = find_min_operators_for_target(sorted_ops, args.combo_target, combo_min, combo_max)
         print_info(f"Using {len(top_ops)} operators for ~{args.combo_target:,} target rules.")
         generated_set = generate_rules_parallel(top_ops, combo_min, combo_max, gpu_mode=STATE.gpu_mode_enabled)
         result_data   = [(r, 1) for r in generated_set]
         print_success(f"Generated {len(result_data):,} combinatorial rules.")
 
-    # ---- Optional interactive processing ----
     print(f"\n{Colors.CYAN}{Colors.BOLD}" + "=" * 60)
     print("ENHANCED PROCESSING OPTIONS")
     print("=" * 60 + f"{Colors.END}")
@@ -2051,10 +1974,9 @@ def concentrator_main_processing(args: Any) -> None:
 # ==============================================================================
 
 def interactive_mode() -> Optional[Dict]:
-    print_header("CONCENTRATOR v3.1 – INTERACTIVE MODE")
+    print_header("CONCENTRATOR v3.2 – INTERACTIVE MODE")
     settings: Dict[str, Any] = {}
 
-    # --- Input paths ---
     print(f"\n{Colors.CYAN}Input Configuration:{Colors.END}")
     while True:
         raw = input(f"{Colors.YELLOW}Enter rule files/directories (space-separated): {Colors.END}").strip()
@@ -2071,7 +1993,6 @@ def interactive_mode() -> Optional[Dict]:
             break
         print_error("No valid paths provided.")
 
-    # --- Quick analysis ---
     print(f"\n{Colors.CYAN}Analysing Input Data...{Colors.END}")
     recommended_mode: Optional[str] = None
     try:
@@ -2122,7 +2043,6 @@ def interactive_mode() -> Optional[Dict]:
     except Exception as exc:
         print_warning(f"Quick analysis failed: {exc}")
 
-    # --- Mode selection ---
     print(f"\n{Colors.CYAN}Processing Mode:{Colors.END}")
     print(f"  {Colors.GREEN}1{Colors.END} – Extract top existing rules")
     print(f"  {Colors.GREEN}2{Colors.END} – Generate combinatorial rules")
@@ -2142,7 +2062,6 @@ def interactive_mode() -> Optional[Dict]:
         else:
             print_error("Enter 1, 2, or 3.")
 
-    # --- Mode-specific params ---
     if settings['mode'] == 'extraction':
         while True:
             try:
@@ -2176,7 +2095,6 @@ def interactive_mode() -> Optional[Dict]:
             except ValueError:
                 print_error("Invalid numbers.")
 
-    # --- Global settings ---
     print(f"\n{Colors.CYAN}Global Settings:{Colors.END}")
     settings['output_base_name'] = (
         input(f"{Colors.YELLOW}Output base name ['concentrator_output']: {Colors.END}").strip()
@@ -2212,7 +2130,6 @@ def interactive_mode() -> Optional[Dict]:
     else:
         settings['temp_dir'] = None
 
-    # Fill defaults for any missing keys
     defaults: Dict[str, Any] = {
         'temp_dir': None, 'no_gpu': False, 'in_memory': False,
         'max_length': 31, 'output_base_name': 'concentrator_output', 'output_format': 'line',
@@ -2224,7 +2141,6 @@ def interactive_mode() -> Optional[Dict]:
     for key, val in defaults.items():
         settings.setdefault(key, val)
 
-    # Confirmation summary
     print(f"\n{Colors.CYAN}Configuration Summary:{Colors.END}")
     print(f"  Mode:          {settings['mode']}")
     print(f"  Input paths:   {len(settings['paths'])} location(s)")
@@ -2287,9 +2203,11 @@ def print_usage() -> None:
         for flag, desc in opts:
             print(f"  {C.YELLOW}{flag:<30}{C.END}{desc}")
 
-    print(f"\n{C.BOLD}{C.CYAN}NOTES (v3.1):{C.END}")
+    print(f"\n{C.BOLD}{C.CYAN}NOTES (v3.2):{C.END}")
     print(f"  {C.WHITE}Memory operators (M 4 6 X) and reject operators (< > ! / ( ) = % Q){C.END}")
     print(f"  {C.WHITE}are filtered at every pipeline stage and will never appear in output.{C.END}")
+    print(f"  {C.WHITE}Combinatorial generation uses full token units ($5, sae, T3) with{C.END}")
+    print(f"  {C.WHITE}round-trip re-parse validation to ensure only valid rules are saved.{C.END}")
 
     print(f"\n{C.BOLD}{C.CYAN}EXAMPLES:{C.END}")
     examples = [
@@ -2325,13 +2243,11 @@ if __name__ == '__main__':
         else:
             print_warning("System will use swap. Performance may degrade.")
 
-    # --- Interactive mode (no args) ---
     if len(sys.argv) == 1:
         settings = interactive_mode()
         if not settings:
             sys.exit(0)
 
-        # Build a simple namespace from the interactive settings dict
         ns = argparse.Namespace(
             paths            = settings['paths'],
             output_base_name = settings['output_base_name'],
@@ -2361,7 +2277,6 @@ if __name__ == '__main__':
         print_usage()
         sys.exit(0)
 
-    # --- CLI mode ---
     else:
         parser = argparse.ArgumentParser(
             description=f'{Colors.CYAN}Unified Hashcat Rule Processor with OpenCL support.{Colors.END}',
