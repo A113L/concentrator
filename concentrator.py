@@ -2,7 +2,45 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations  # Python 3.8+ type-hint compatibility
 """
-CONCENTRATOR v3.2 - Unified Hashcat Rule Processor
+CONCENTRATOR v3.3 - Unified Hashcat Rule Processor
+
+Changes from v3.2 → v3.3
+─────────────────────────
+1. Full token-level Markov model (get_markov_model)
+   The model is now built on atomic hashcat TOKENS produced by TOKEN_REGEX
+   (e.g. 'l', '$5', 'sae', 'T3') instead of raw characters.  Three
+   transition tables are maintained:
+
+     START → first_token          (key: '^')
+     token_i → token_{i+1}        (key: token string, unigram context)
+     (token_{i-1}, token_i) →     (key: 2-tuple of token strings, bigram ctx)
+         token_{i+1}
+
+   Only rules that pass the round-trip tokenisation check are used for
+   training, so the model is never confused by partially-tokenisable input.
+   The function now prints a summary of how many start/unigram/bigram
+   contexts were learned.
+
+2. Token-level rule scoring (get_markov_weighted_rules)
+   Log-probability scoring now operates on TOKEN sequences, not characters.
+   Scoring strategy: P(tok[0]|START) × ∏ P(tok[i]|bigram or unigram ctx).
+   Rules that do not tokenise cleanly are silently skipped.
+
+3. Token-level Markov walk (generate_rules_from_markov_model)
+   The random walk now samples full TOKENS at every step, replacing the old
+   character-by-character walk.  Key improvements:
+
+   • min_len / max_len count TOKENS (operators), not raw bytes.  This is the
+     natural measure of rule complexity for hashcat (a rule with 3 tokens is
+     exactly 3 chained operators regardless of argument byte lengths).
+   • Every walk candidate is structurally valid — concatenating valid tokens
+     always produces a valid rule — so the rejection rate is near zero
+     compared to the old character-level walk.
+   • Banned operators (NEVER_PRODUCE_OPS) are excluded at sampling time;
+     the _has_banned_op() paranoia check and the TOKEN_REGEX round-trip gate
+     are still applied before any rule is accepted.
+   • Budget increased to target × 20 attempts (was × 5) to compensate for
+     potentially smaller Markov graphs when only real operators are nodes.
 
 Changes from v3.1 → v3.2
 ─────────────────────────
@@ -258,7 +296,7 @@ OPERATORS_REQUIRING_ARGS: Dict[str, int] = {
 
 def print_banner() -> None:
     print(f"\n{Colors.CYAN}{Colors.BOLD}" + "=" * 80)
-    print("          CONCENTRATOR v3.2 - Unified Hashcat Rule Processor")
+    print("          CONCENTRATOR v3.3 - Unified Hashcat Rule Processor")
     print("=" * 80 + f"{Colors.END}")
     features = [
         "OpenCL GPU Acceleration for validation and generation",
@@ -751,63 +789,134 @@ def analyze_rule_files_parallel(
 def get_markov_model(
     unique_rules: Dict[str, int]
 ) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Build a second-order token-level Markov model from a rule corpus.
+
+    The model operates on atomic hashcat TOKENS (as produced by TOKEN_REGEX),
+    NOT on raw characters.  A token is the smallest meaningful unit of a
+    hashcat rule — e.g. 'l', 'u', '$5', 'sae', 'T3', 'i2X'.  Using tokens
+    instead of characters ensures that:
+
+      • Transitions reflect semantically meaningful operator sequences.
+      • Every walk through the model produces structurally valid rules because
+        every token is itself a complete, valid operator+argument unit.
+      • min_len / max_len refer to operator counts, not byte lengths, which is
+        the natural measure of rule complexity for hashcat.
+
+    Three transition tables are stored under the same 'probs' dict:
+
+      START → first_token          key: '^'  (string)
+      token_i → token_{i+1}        key: token_i  (string, unigram context)
+      (token_{i-1}, token_i) →     key: (token_{i-1}, token_i)  (tuple, bigram context)
+          token_{i+1}
+
+    The bigram context is tried first during generation/scoring; the unigram
+    is used as a fallback when no bigram entry exists.
+    """
     if not memory_intensive_operation_warning("Markov model building"):
         return None, None
-    print_section("Building Markov Sequence Probability Model")
+    print_section("Building Token-Level Markov Sequence Probability Model")
     counts: Dict = defaultdict(lambda: defaultdict(int))
-    START  = '^'
+    START = '^'
+    skipped = 0
     for rule in unique_rules:
         if not rule:
             continue
-        counts[START][rule[0]] += 1
-        for i in range(len(rule) - 1):
-            counts[rule[i]][rule[i + 1]] += 1
-        for i in range(len(rule) - 2):
-            counts[rule[i:i + 2]][rule[i + 2]] += 1
+        tokens = TOKEN_REGEX.findall(rule)
+        # Only train on rules that tokenize cleanly (round-trip check)
+        if not tokens or ''.join(tokens) != rule:
+            skipped += 1
+            continue
+        # START → first token
+        counts[START][tokens[0]] += 1
+        # Unigram transitions: tokens[i] → tokens[i+1]
+        for i in range(len(tokens) - 1):
+            counts[tokens[i]][tokens[i + 1]] += 1
+        # Bigram transitions: (tokens[i], tokens[i+1]) → tokens[i+2]
+        for i in range(len(tokens) - 2):
+            bigram_key = (tokens[i], tokens[i + 1])
+            counts[bigram_key][tokens[i + 2]] += 1
+
+    if skipped:
+        print_warning(f"Markov training: skipped {skipped:,} rules that did not tokenize cleanly.")
 
     totals = {k: sum(v.values()) for k, v in counts.items()}
-    probs:  Dict = defaultdict(lambda: defaultdict(float))
+    probs: Dict = defaultdict(lambda: defaultdict(float))
     for prefix, next_counts in counts.items():
         t = totals[prefix]
         for nxt, cnt in next_counts.items():
             probs[prefix][nxt] = cnt / t
 
+    unique_first_tokens = len(probs.get(START, {}))
+    unique_unigrams = sum(1 for k in probs if isinstance(k, str) and k != START)
+    unique_bigrams  = sum(1 for k in probs if isinstance(k, tuple))
+    print_success(
+        f"Token-level Markov model built: "
+        f"{unique_first_tokens} start tokens, "
+        f"{unique_unigrams} unigram contexts, "
+        f"{unique_bigrams} bigram contexts."
+    )
     return probs, totals
 
 
 def get_markov_weighted_rules(
-    unique_rules:        Dict[str, int],
+    unique_rules:         Dict[str, int],
     markov_probabilities: Dict,
-    total_transitions:   Dict,
+    total_transitions:    Dict,
 ) -> List[Tuple[str, float]]:
+    """Score each rule by its log-probability under the token-level Markov model.
+
+    Scoring strategy (mirrors the generation walk):
+      1. P(tokens[0] | START)
+      2. For each subsequent token tokens[i] (i ≥ 1):
+           a. Try bigram context (tokens[i-2], tokens[i-1]) → tokens[i]   (if i ≥ 2)
+           b. Fall back to unigram context tokens[i-1] → tokens[i]
+           c. If neither context exists the rule is assigned -∞ and skipped.
+
+    Rules that do not tokenize cleanly (round-trip check fails) are silently
+    dropped — they cannot have been produced by the model.
+    """
     if not memory_intensive_operation_warning("Markov weighting"):
         return []
+    START    = '^'
     weighted: List[Tuple[str, float]] = []
+
     for rule in unique_rules:
         if not rule:
             continue
-        logp    = 0.0
-        current = '^'
-        nxt     = rule[0]
-        if nxt not in markov_probabilities[current]:
+        tokens = TOKEN_REGEX.findall(rule)
+        if not tokens or ''.join(tokens) != rule:
+            continue  # rule does not tokenize cleanly
+
+        logp  = 0.0
+        valid = True
+
+        # ── Score first token ─────────────────────────────────────────────
+        if tokens[0] not in markov_probabilities.get(START, {}):
             continue
-        logp += math.log(markov_probabilities[current][nxt])
-        for i in range(len(rule) - 1):
-            if i >= 1:
-                prefix = rule[i - 1:i + 1]
-                nxt    = rule[i + 1]
-                if prefix in markov_probabilities and nxt in markov_probabilities[prefix]:
-                    logp += math.log(markov_probabilities[prefix][nxt])
-                    continue
-            prefix = rule[i]
-            nxt    = rule[i + 1]
-            if prefix in markov_probabilities and nxt in markov_probabilities[prefix]:
-                logp += math.log(markov_probabilities[prefix][nxt])
-            else:
-                logp = -float('inf')
-                break
-        if logp > -float('inf'):
+        logp += math.log(markov_probabilities[START][tokens[0]])
+
+        # ── Score subsequent tokens ───────────────────────────────────────
+        for i in range(1, len(tokens)):
+            scored = False
+            # Try bigram context first (available from position i=2 onward)
+            if i >= 2:
+                bigram_key = (tokens[i - 2], tokens[i - 1])
+                if (bigram_key in markov_probabilities
+                        and tokens[i] in markov_probabilities[bigram_key]):
+                    logp += math.log(markov_probabilities[bigram_key][tokens[i]])
+                    scored = True
+            if not scored:
+                # Fall back to unigram context
+                prev = tokens[i - 1]
+                if prev in markov_probabilities and tokens[i] in markov_probabilities[prev]:
+                    logp += math.log(markov_probabilities[prev][tokens[i]])
+                else:
+                    valid = False
+                    break
+
+        if valid:
             weighted.append((rule, logp))
+
     return sorted(weighted, key=lambda kv: kv[1], reverse=True)
 
 
@@ -823,7 +932,38 @@ def generate_rules_from_markov_model(
     gpu_mode:             bool = False,
     excluded_operators:   Optional[Set[str]] = None,
 ) -> List[Tuple[str, float]]:
-    """Generate *target* valid hashcat rules via a Markov walk.
+    """Generate *target* valid hashcat rules via a token-level Markov walk.
+
+    ── Key design decisions ────────────────────────────────────────────────
+
+    TOKEN-LEVEL walk (v3.3 improvement over v3.2 character-level walk):
+      The walk samples full hashcat TOKENS at every step instead of single
+      characters.  A token is an atomic operator+argument unit (e.g. 'l',
+      '$5', 'sae', 'i3X') as produced by TOKEN_REGEX.  This guarantees that
+      every candidate rule is structurally valid and eliminates the massive
+      rejection rate of the old character-level approach.
+
+    LENGTH SEMANTICS:
+      min_len / max_len now count TOKENS (operators), not raw bytes.
+      min_len=1, max_len=3 means rules with 1, 2, or 3 chained operators.
+      This is the natural measure of rule complexity for hashcat.
+
+    SAMPLING STRATEGY:
+      1. Sample first token from P(token | START).
+      2. At each subsequent step, try the bigram context
+         (tokens[-2], tokens[-1]) first; fall back to unigram tokens[-1].
+      3. Accept the current sequence as a rule whenever
+         min_len ≤ len(token_seq) ≤ max_len.
+      4. Continue extending until max_len is reached or no transition exists.
+
+    SAFETY NETS:
+      • Tokens whose leading operator is in excluded_operators are never
+        sampled (NEVER_PRODUCE_OPS by default).
+      • After joining, _has_banned_op() is checked as a paranoia guard.
+      • TOKEN_REGEX round-trip validation confirms the joined string re-
+        tokenises back to the exact same token list.
+      • is_valid_hashcat_rule() / HashcatRuleCleaner.validate_rule() provide
+        a final syntactic gate.
 
     v3.1: excluded_operators defaults to NEVER_PRODUCE_OPS.
     """
@@ -832,18 +972,28 @@ def generate_rules_from_markov_model(
     if excluded_operators is None:
         excluded_operators = NEVER_PRODUCE_OPS
 
-    print_section(f"Generating Markov Rules ({min_len}–{max_len}, target: {target:,})")
+    print_section(
+        f"Generating Token-Level Markov Rules "
+        f"({min_len}–{max_len} tokens/operators, target: {target:,})"
+    )
     print_info(f"Excluding operators: {', '.join(sorted(excluded_operators))}")
 
     START = '^'
 
-    def _next(prefix: str) -> Optional[str]:
-        if prefix not in markov_probabilities:
+    def _sample_next(context) -> Optional[str]:
+        """Sample the next token given a context key (str or 2-tuple of str).
+
+        Only tokens whose leading operator character is NOT in
+        excluded_operators are eligible.  The returned value is a full token
+        string such as 'l', '$5', or 'sae'.
+        """
+        if context not in markov_probabilities:
             return None
-        choices, weights = [], []
-        for op, prob in markov_probabilities[prefix].items():
-            if op not in excluded_operators:
-                choices.append(op)
+        choices: List[str]   = []
+        weights: List[float] = []
+        for tok, prob in markov_probabilities[context].items():
+            if tok[0] not in excluded_operators:
+                choices.append(tok)
                 weights.append(prob)
         if not choices:
             return None
@@ -853,29 +1003,64 @@ def generate_rules_from_markov_model(
         return random.choices(choices, weights=[w / total for w in weights], k=1)[0]
 
     generated: Set[str] = set()
-    for _ in range(target * 5):
+    max_attempts = target * 20  # generous budget; most walks succeed
+
+    for _ in range(max_attempts):
         if len(generated) >= target:
             break
-        rule = _next(START)
-        if not rule:
+
+        # ── Step 1: Sample the first token ────────────────────────────────
+        first = _sample_next(START)
+        if not first:
             continue
-        while len(rule) < max_len:
-            last_two = rule[-2:] if len(rule) >= 2 else None
-            nxt = (_next(last_two) if last_two and last_two in markov_probabilities else None)
+        token_seq: List[str] = [first]
+
+        # ── Step 2: Extend the token chain up to max_len ──────────────────
+        while len(token_seq) < max_len:
+            # Prefer bigram context; fall back to unigram
+            if len(token_seq) >= 2:
+                bigram_key = (token_seq[-2], token_seq[-1])
+                nxt = _sample_next(bigram_key)
+                if not nxt:
+                    nxt = _sample_next(token_seq[-1])
+            else:
+                nxt = _sample_next(token_seq[-1])
+
             if not nxt:
-                nxt = _next(rule[-1])
-            if not nxt:
-                break
-            rule += nxt
-            if min_len <= len(rule) <= max_len:
+                break  # dead end — accept what we have if in range
+
+            token_seq.append(nxt)
+
+            # ── Step 3: Accept if token count is in [min_len, max_len] ────
+            if min_len <= len(token_seq) <= max_len:
+                rule = ''.join(token_seq)
+
+                # Paranoia guard: no banned operator must have slipped in
+                if _has_banned_op(rule):
+                    continue
+                # Round-trip validation: joined string must re-tokenise to
+                # the exact same token list (catches accidental merges)
+                if TOKEN_REGEX.findall(rule) != token_seq:
+                    continue
+                # Final syntactic gate
                 if gpu_mode:
-                    cleaner = HashcatRuleCleaner(2)
-                    if cleaner.validate_rule(rule):
+                    if HashcatRuleCleaner(2).validate_rule(rule):
                         generated.add(rule)
                 elif is_valid_hashcat_rule(rule):
                     generated.add(rule)
 
-    print_success(f"Generated {len(generated):,} valid rules.")
+        # Also accept chain at min_len even if we broke out before max_len
+        if len(token_seq) >= min_len:
+            rule = ''.join(token_seq[:min_len])
+            if (not _has_banned_op(rule)
+                    and TOKEN_REGEX.findall(rule) == token_seq[:min_len]):
+                if gpu_mode:
+                    if HashcatRuleCleaner(2).validate_rule(rule):
+                        generated.add(rule)
+                elif is_valid_hashcat_rule(rule):
+                    generated.add(rule)
+
+    print_success(f"Generated {len(generated):,} valid token-level Markov rules.")
     if not generated:
         return []
     dummy = {r: 1 for r in generated}
@@ -1525,7 +1710,7 @@ def save_rules(
 
     try:
         with open(filename, 'w', encoding='utf-8') as fh:
-            fh.write(f"# CONCENTRATOR v3.2 – {mode_name.upper()} MODE OUTPUT\n")
+            fh.write(f"# CONCENTRATOR v3.3 – {mode_name.upper()} MODE OUTPUT\n")
             fh.write(f"# Generated:   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             fh.write(f"# Total rules: {len(clean_data):,}\n")
             fh.write(f"# Format:      {STATE.output_format}\n#\n")
@@ -1694,7 +1879,7 @@ def enhanced_interactive_processing_loop(
             choice = input(f"{Colors.YELLOW}Enter choice: {Colors.RESET}").strip().lower()
 
             if choice == 'q':
-                print_header("THANK YOU FOR USING CONCENTRATOR v3.2!")
+                print_header("THANK YOU FOR USING CONCENTRATOR v3.3!")
                 break
 
             elif choice == 'p':
@@ -1974,7 +2159,7 @@ def concentrator_main_processing(args: Any) -> None:
 # ==============================================================================
 
 def interactive_mode() -> Optional[Dict]:
-    print_header("CONCENTRATOR v3.2 – INTERACTIVE MODE")
+    print_header("CONCENTRATOR v3.3 – INTERACTIVE MODE")
     settings: Dict[str, Any] = {}
 
     print(f"\n{Colors.CYAN}Input Configuration:{Colors.END}")
@@ -2203,7 +2388,7 @@ def print_usage() -> None:
         for flag, desc in opts:
             print(f"  {C.YELLOW}{flag:<30}{C.END}{desc}")
 
-    print(f"\n{C.BOLD}{C.CYAN}NOTES (v3.2):{C.END}")
+    print(f"\n{C.BOLD}{C.CYAN}NOTES (v3.3):{C.END}")
     print(f"  {C.WHITE}Memory operators (M 4 6 X) and reject operators (< > ! / ( ) = % Q){C.END}")
     print(f"  {C.WHITE}are filtered at every pipeline stage and will never appear in output.{C.END}")
     print(f"  {C.WHITE}Combinatorial generation uses full token units ($5, sae, T3) with{C.END}")
