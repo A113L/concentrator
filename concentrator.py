@@ -79,16 +79,15 @@ Changes from v3.0 → v3.1
      • HashcatRuleCleaner.validate_rule (both modes) – always rejects banned ops
      • save_rules – final safety net, drops any slipped-through rule
 
-2. Expanded TEST_VECTOR (21 → 52 words)
-   The minimizer deduplicates rules whose functional signatures are identical on
-   the test vector.  With only 21 short words many position-specific operators
-   (D5, i7X, O3A …) produced identical signatures and were incorrectly merged.
-   The new vector covers:
-     • lengths 1-32  (exercises every base-36 position operand 0-V)
-     • all-lowercase, all-uppercase, mixed, digits-only
-     • strings with special characters
-     • strings with internal spaces, underscores, hyphens
-   This makes false-positive collisions far less likely.
+2. Unified TEST_VECTOR (sourced from minimizer.py BUILTIN_PROBES)
+   The TEST_VECTOR is now drawn exclusively from minimizer.py's BUILTIN_PROBES
+   so that both tools compute signatures against an identical word set.  The
+   shared probe set covers:
+     • lengths 2–11  (exercises position ops across short and medium words)
+     • all-lowercase, mixed-case, embedded-digit, and special-char words
+     • repeated-character strings (aaaa, bbbb)
+   Using a single canonical probe set ensures that a rule minimized by
+   minimizer.py will never collide differently in concentrator.py.
 
 3. Minor clean-ups
    • _GPU_DENIED_OPS removed (replaced by NEVER_PRODUCE_OPS)
@@ -1351,11 +1350,10 @@ class RuleEngine:
 #    This eliminates false collisions caused by output values that happen to
 #    contain the separator character used in the old '|'.join() approach.
 #
-# 3. Extended probe vector (TEST_VECTOR)
-#    Merged concentrator's original 52-word vector with minimizer.py's
-#    BUILTIN_PROBES.  Critical additions: "password" (was missing!), short
-#    common base words (pass, root, admin, letmein …), mixed-case compounds
-#    (AdminUser, HelloWorld …), and embedded-digit words (pass123, user9999).
+# 3. Unified probe vector (TEST_VECTOR)
+#    Now sourced exclusively from minimizer.py's BUILTIN_PROBES so that both
+#    tools use an identical word set.  Covers lengths 2–11, mixed-case,
+#    embedded-digit, special-char, and repeated-char strings.
 #
 # 4. SQLite-backed deduplication (_functional_minimization_sqlite)
 #    For rulesets > _MIN_SQLITE_THRESHOLD (1 M rules) the signature map lives
@@ -1634,69 +1632,60 @@ def _min_compute_signature(rule: str, probe_words: List[str]) -> tuple:
 # ---------------------------------------------------------------------------
 # Probe vector (TEST_VECTOR)
 # ---------------------------------------------------------------------------
-# Concentrator's original 52-word vector merged with minimizer.py's
-# BUILTIN_PROBES.  Critical additions: "password" (was missing from the
-# original), short common base words (pass, root, admin, letmein …),
-# mixed-case compounds (AdminUser, HelloWorld …), embedded-digit words
-# (pass123, user9999 …), and "bbbb" for repeated-char coverage.
+# Sourced exclusively from minimizer.py's BUILTIN_PROBES.  Hand-curated to
+# exercise every interesting opcode category:
+#
+#   len 2–4  → k, K, {, }, [, ] edge cases; x/O/D on short words
+#   len 4–6  → T3, i0X, D0, position ops within short words
+#   len 7–9  → typical real-world password base word range
+#   len 10+  → truncation and repeat ops ('y','Y','z','Z','p')
+#   Mixed-case → l, u, c, C, t, E, T, k, K
+#   Digits   → @, s, o on numeric chars; pure numeric suffix probing
+#   Specials → @-removal, s-substitution on punctuation chars
+#   Repeated → q (char doubling), z/Z (char extension)
 
 TEST_VECTOR: List[str] = [
-    # ── very short — edge cases for k, K, {, }, [, ] ────────────────────
-    "ab", "abc", "abcd",
-    # ── single chars and 2-char words ────────────────────────────────────
-    "a", "Z", "1", "aB", "42", "AB", "0",
-    # ── short alphanumeric (len 4–6) ─────────────────────────────────────
-    "pass", "root", "test", "admin", "login",
-    # ── length 5–8 (original concentrator set) ───────────────────────────
-    "hello", "World", "ADMIN", "12345", "abc12", "P@ss1", "TEST", "Test",
-    # ── typical password base words (len 7–9) ────────────────────────────
+    # ── very short — edge cases for k, K, {, }, [, ] ────────────────
+    "ab",
+    "abc",
+    "abcd",
+    # ── short alphanumeric (len 4–6) ─────────────────────────────────
+    "pass",
+    "root",
+    "test",
+    "admin",
+    "login",
+    # ── typical password base words (len 7–9) ────────────────────────
     "letmein",          # len 7
     "welcome",          # len 7
-    "password",         # len 8  ← THE critical probe word (was missing!)
+    "password",         # len 8  ← THE critical probe word
     "sunshine",         # len 8
     "football",         # len 8
     "baseball",         # len 8
     "princess",         # len 8
     "dragon12",         # len 8, ends with digits
-    # ── length 9–12 (original concentrator set) ──────────────────────────
-    "Password1", "qwertyuio", "ABCDEFGHIJK", "0123456789",
-    "pass_word", "hello-you",
-    # ── longer words (len 10+) — truncation / repeat ops ─────────────────
+    # ── longer words (len 10+) — truncation / repeat ops ─────────────
     "qwertyuiop",       # len 10
     "iloveyou12",       # len 10, trailing digits
     "monkey12345",      # len 11
     "superman123",      # len 11
     "mustang2024",      # len 11
-    # ── mixed-case — l/u/c/C/t/E/T/k/K ──────────────────────────────────
-    "Password", "AdminUser", "MySecret", "HelloWorld",
-    # ── length 13–16 (original concentrator set) ─────────────────────────
-    "Password12345", "administrator", "Summer2023pass",
-    "QWERTYUIOPLKJ", "correctHorse!1",
-    # ── length 17–20 (original concentrator set) ─────────────────────────
-    "verylongpassword1!", "A1b2C3d4E5f6G7h8",
-    "abcdefghijklmnopq", "ABCDEFGHIJKLMNOPQ",
-    # ── length 21–24 (original concentrator set) ─────────────────────────
-    "thisisaverylongstring", "A1b2C3d4E5f6G7h8I9j0",
-    "abcdefghijklmnopqrstu",
-    # ── length 25–28 (original concentrator set) ─────────────────────────
-    "averylongpasswordindeed12", "ABCDEFGHIJKLMNOPQRSTUVWXY",
-    "abcdefghijklmnopqrstuvwxy",
-    # ── length 29–32 (original concentrator set) ─────────────────────────
-    "aVerylongPasswordWithNumbers12", "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234",
-    "abcdefghijklmnopqrstuvwxyz1234",
-    # ── embedded digits — s, o, @, T ops ─────────────────────────────────
-    "pass123", "admin2024", "test1234", "user9999",
-    # ── special characters — @ removal, s substitution ───────────────────
-    "spec!", "!spec", "pa$$word", "s3cr3t!", "P@ssw0rd!",
-    "p@ssw0rd", "s3cur1ty",
-    # ── with spaces / underscores / hyphens ──────────────────────────────
-    "hello world", "foo_bar", "test-case",
-    # ── tricky case-change patterns ──────────────────────────────────────
-    "hElLo", "pAsSwOrD", "tEsT", "xYz!",
-    # ── pure digits ──────────────────────────────────────────────────────
-    "01", "000", "99999", "1234567890",
-    # ── repeated chars (exercises z, Z, q) ───────────────────────────────
-    "aaaa", "ZZZZ", "1111", "bbbb",
+    # ── mixed-case — l/u/c/C/t/E/T/k/K ─────────────────────────────
+    "Password",
+    "AdminUser",
+    "MySecret",
+    "HelloWorld",
+    # ── words with embedded digits — s, o, @, T ──────────────────────
+    "pass123",
+    "admin2024",
+    "test1234",
+    "user9999",
+    # ── words with special chars — @ removal, s substitution ─────────
+    "p@ssw0rd",
+    "s3cur1ty",
+    # ── repeated chars — q (double each), z/Z (extend) ───────────────
+    "aaaa",
+    "bbbb",
 ]
 
 # Deduplicate while preserving order
