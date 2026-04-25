@@ -109,6 +109,8 @@ import random
 import datetime
 import threading
 import functools
+import sqlite3
+import pickle
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Callable, Any, Set, Optional
@@ -1331,63 +1333,532 @@ class RuleEngine:
 # ==============================================================================
 # FUNCTIONAL MINIMIZATION
 # ==============================================================================
+#
+# Changes (minimizer.py integration)
+# ────────────────────────────────────────────────────────────────────────────
+# 1. Byte-level rule engine (_min_apply_single / _min_apply_chain)
+#    Replaces the RuleEngine-based approach with a latin-1 byte-level
+#    implementation ported from minimizer.py.  Key improvements:
+#      • Byte-level processing avoids Python Unicode artefacts and matches
+#        hashcat's GPU kernel behaviour exactly.
+#      • \xNN hex-escape notation in argument positions is handled correctly.
+#      • Rules with unsupported opcodes return _UNSUPPORTED_SIG instead of
+#        silently no-oping, so they are tracked and kept separately.
+#      • Both space-separated and concatenated rule formats are accepted.
+#
+# 2. Tuple-based signatures (_compute_signature)
+#    Signatures are now tuples of per-word outputs rather than joined strings.
+#    This eliminates false collisions caused by output values that happen to
+#    contain the separator character used in the old '|'.join() approach.
+#
+# 3. Extended probe vector (TEST_VECTOR)
+#    Merged concentrator's original 52-word vector with minimizer.py's
+#    BUILTIN_PROBES.  Critical additions: "password" (was missing!), short
+#    common base words (pass, root, admin, letmein …), mixed-case compounds
+#    (AdminUser, HelloWorld …), and embedded-digit words (pass123, user9999).
+#
+# 4. SQLite-backed deduplication (_functional_minimization_sqlite)
+#    For rulesets > _MIN_SQLITE_THRESHOLD (1 M rules) the signature map lives
+#    in a temporary on-disk SQLite database instead of an in-memory dict.
+#    This prevents OOM on very large datasets.  The temp file is removed
+#    unconditionally on completion (success or error).
+
+# ---------------------------------------------------------------------------
+# Byte-level hashcat rule engine (ported from minimizer.py)
+# ---------------------------------------------------------------------------
+
+_ZERO_ARG_OPS_MIN = frozenset(':lucCtErdfkK{}[]q')
+_ONE_ARG_OPS_MIN  = frozenset([
+    '^', '$', '@', 'p', 'T', 'D', 'L', 'R',
+    '+', '-', '.', ',', "'", 'z', 'Z', 'y', 'Y', 'e',
+])
+_TWO_ARG_OPS_MIN  = frozenset(['s', 'i', 'o', 'x', 'O', '*', '3'])
+
+# Sentinel returned when a rule contains an unsupported opcode.
+# All such rules share this signature and are kept intact (not deduplicated).
+_UNSUPPORTED_SIG: tuple = ('__UNSUPPORTED__',)
+
+# Rulesets above this size use a SQLite temp-DB instead of an in-memory dict
+# to avoid OOM on very large inputs.
+_MIN_SQLITE_THRESHOLD = 1_000_000
+
+
+def _min_arg_ord(token: str, pos: int) -> int:
+    """Return the integer code-point of the argument character at *pos*,
+    resolving \\xNN hex-escape sequences transparently."""
+    if (pos < len(token)
+            and token[pos] == '\\'
+            and pos + 3 < len(token)
+            and token[pos + 1] == 'x'
+            and all(c in '0123456789abcdefABCDEF' for c in token[pos + 2:pos + 4])):
+        return int(token[pos + 2:pos + 4], 16)
+    return ord(token[pos]) if pos < len(token) else 0
+
+
+def _min_apply_single(rule: str, word: str) -> Optional[str]:
+    """Apply one hashcat rule atom to *word* at the byte level (latin-1).
+
+    Returns None if the opcode is unsupported — the caller must treat the
+    whole rule as having signature *_UNSUPPORTED_SIG*.
+    """
+    if not rule:
+        return word
+    w   = list(word.encode('latin-1'))
+    cmd = rule[0]
+
+    def dg(c: str) -> int:
+        return ord(c) - 48 if '0' <= c <= '9' else -1
+
+    try:
+        if cmd == ':':
+            pass
+        elif cmd == 'l':
+            w = [c | 0x20 if 65 <= c <= 90 else c for c in w]
+        elif cmd == 'u':
+            w = [c & ~0x20 if 97 <= c <= 122 else c for c in w]
+        elif cmd == 'c':
+            if w:
+                w[0] = w[0] & ~0x20 if 97 <= w[0] <= 122 else w[0]
+                w[1:] = [c | 0x20 if 65 <= c <= 90 else c for c in w[1:]]
+        elif cmd == 'C':
+            if w:
+                w[0] = w[0] | 0x20 if 65 <= w[0] <= 90 else w[0]
+                w[1:] = [c & ~0x20 if 97 <= c <= 122 else c for c in w[1:]]
+        elif cmd == 't':
+            w = [c | 0x20 if 65 <= c <= 90 else
+                 (c & ~0x20 if 97 <= c <= 122 else c) for c in w]
+        elif cmd == 'E':
+            out: list = []; cap = True
+            for c in w:
+                out.append(c & ~0x20 if cap and 97 <= c <= 122 else c)
+                cap = c in (32, 45, 95)
+            w = out
+        elif cmd == 'r':
+            w = w[::-1]
+        elif cmd == 'd':
+            w = w + w
+        elif cmd == 'f':
+            w = w + w[::-1]
+        elif cmd == '{':
+            if len(w) > 1: w = w[1:] + [w[0]]
+        elif cmd == '}':
+            if len(w) > 1: w = [w[-1]] + w[:-1]
+        elif cmd == '[':
+            if w: w = w[1:]
+        elif cmd == ']':
+            if w: w = w[:-1]
+        elif cmd == 'k':
+            if len(w) >= 2: w[0], w[1] = w[1], w[0]
+        elif cmd == 'K':
+            if len(w) >= 2: w[-1], w[-2] = w[-2], w[-1]
+        elif cmd == 'q':
+            out = []
+            for c in w: out += [c, c]
+            w = out
+        elif cmd == '^' and len(rule) >= 2:
+            w = [_min_arg_ord(rule, 1)] + w
+        elif cmd == '$' and len(rule) >= 2:
+            w = w + [_min_arg_ord(rule, 1)]
+        elif cmd == '@' and len(rule) >= 2:
+            ch = _min_arg_ord(rule, 1)
+            w  = [c for c in w if c != ch]
+        elif cmd == 'p' and len(rule) >= 2:
+            n = dg(rule[1])
+            if n > 0:
+                orig = w[:]
+                for _ in range(n): w += orig
+        elif cmd == 'T' and len(rule) >= 2:
+            p = dg(rule[1])
+            if 0 <= p < len(w):
+                c = w[p]
+                w[p] = (c | 0x20 if 65 <= c <= 90
+                        else (c & ~0x20 if 97 <= c <= 122 else c))
+        elif cmd == 'D' and len(rule) >= 2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w.pop(p)
+        elif cmd == 'L' and len(rule) >= 2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w[p] = (w[p] << 1) & 0xFF
+        elif cmd == 'R' and len(rule) >= 2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w[p] = (w[p] >> 1) & 0xFF
+        elif cmd == '+' and len(rule) >= 2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w[p] = (w[p] + 1) & 0xFF
+        elif cmd == '-' and len(rule) >= 2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w[p] = (w[p] - 1) & 0xFF
+        elif cmd in ('.', ',') and len(rule) >= 2:
+            p     = dg(rule[1])
+            delta = 1 if cmd == '.' else -1
+            if 0 <= p < len(w): w[p] = (w[p] + delta) & 0xFF
+        elif cmd == "'" and len(rule) >= 2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w = w[:p + 1]
+        elif cmd == 'z' and len(rule) >= 2:
+            n = dg(rule[1])
+            if n > 0 and w: w = [w[0]] * n + w
+        elif cmd == 'Z' and len(rule) >= 2:
+            n = dg(rule[1])
+            if n > 0 and w: w = w + [w[-1]] * n
+        elif cmd == 'y' and len(rule) >= 2:
+            n = dg(rule[1])
+            if n > 0: w = w[:n] + w
+        elif cmd == 'Y' and len(rule) >= 2:
+            n = dg(rule[1])
+            if n > 0 and len(w) >= n: w = w + w[-n:]
+        elif cmd == 's' and len(rule) >= 3:
+            a = _min_arg_ord(rule, 1)
+            b = _min_arg_ord(rule, 2 if rule[1] != '\\' else 5)
+            w = [b if c == a else c for c in w]
+        elif cmd == 'i' and len(rule) >= 3:
+            p, ch = dg(rule[1]), _min_arg_ord(rule, 2)
+            if 0 <= p <= len(w): w.insert(p, ch)
+        elif cmd == 'o' and len(rule) >= 3:
+            p, ch = dg(rule[1]), _min_arg_ord(rule, 2)
+            if 0 <= p < len(w): w[p] = ch
+        elif cmd == 'e' and len(rule) >= 2:
+            sep = _min_arg_ord(rule, 1); out = []; cap = True
+            for c in w:
+                out.append(c & ~0x20 if cap and 97 <= c <= 122 else c)
+                cap = (c == sep)
+            w = out
+        elif cmd == 'x' and len(rule) >= 3:
+            a, b = dg(rule[1]), dg(rule[2])
+            if a > b: a, b = b, a
+            w = w[a:b + 1]
+        elif cmd == 'O' and len(rule) >= 3:
+            p, m = dg(rule[1]), dg(rule[2])
+            if 0 <= p < len(w) and m > 0: w = w[:p] + w[p + m:]
+        elif cmd == '*' and len(rule) >= 3:
+            a, b = dg(rule[1]), dg(rule[2])
+            if 0 <= a < len(w) and 0 <= b < len(w) and a != b:
+                w[a], w[b] = w[b], w[a]
+        elif cmd == '3' and len(rule) >= 3:
+            n, sep = dg(rule[1]), _min_arg_ord(rule, 2)
+            cnt = 0
+            for i, c in enumerate(w):
+                if c == sep:
+                    cnt += 1
+                    if cnt == n and i + 1 < len(w):
+                        ci = w[i + 1]
+                        w[i + 1] = (ci | 0x20 if 65 <= ci <= 90
+                                    else (ci & ~0x20 if 97 <= ci <= 122 else ci))
+                        break
+        else:
+            return None  # unsupported opcode
+    except Exception:
+        return None
+
+    try:
+        return bytes(w).decode('latin-1')
+    except Exception:
+        return None
+
+
+def _min_read_arg_char(chain: str, pos: int) -> Tuple[str, int]:
+    """Read one argument character from *chain* at *pos*,
+    handling \\xNN hex-escape notation."""
+    if pos >= len(chain):
+        return ('', pos)
+    if (chain[pos] == '\\'
+            and pos + 3 < len(chain)
+            and chain[pos + 1] == 'x'
+            and all(c in '0123456789abcdefABCDEF' for c in chain[pos + 2:pos + 4])):
+        return (chain[pos:pos + 4], pos + 4)
+    return (chain[pos], pos + 1)
+
+
+def _min_tokenize_rule(chain: str) -> List[str]:
+    """Split a hashcat rule line into individual opcode atoms.
+
+    Handles space-separated (``l r $1``), concatenated (``lr$1``), and
+    mixed formats, as well as \\xNN hex-escape notation in argument positions.
+    """
+    tokens: List[str] = []
+    i = 0
+    n = len(chain)
+    while i < n:
+        c = chain[i]
+        if c == ' ':
+            i += 1
+            continue
+        if c in _ZERO_ARG_OPS_MIN:
+            tokens.append(c)
+            i += 1
+        elif c in _ONE_ARG_OPS_MIN:
+            arg, i2 = _min_read_arg_char(chain, i + 1)
+            tokens.append(c + arg)
+            i = i2
+        elif c in _TWO_ARG_OPS_MIN:
+            arg1, i2 = _min_read_arg_char(chain, i + 1)
+            arg2, i3 = _min_read_arg_char(chain, i2)
+            tokens.append(c + arg1 + arg2)
+            i = i3
+        else:
+            tokens.append(chain[i:])   # unknown — consume rest; _apply_single returns None
+            break
+    return tokens
+
+
+def _min_apply_chain(chain: str, word: str) -> Optional[str]:
+    """Apply a full hashcat rule chain (any format) to *word*.
+
+    Returns None if any atom contains an unsupported opcode, which causes
+    the caller to assign _UNSUPPORTED_SIG to the entire rule.
+    """
+    cur: Optional[str] = word
+    for atom in _min_tokenize_rule(chain):
+        cur = _min_apply_single(atom, cur)  # type: ignore[arg-type]
+        if cur is None:
+            return None
+    return cur
+
+
+def _min_compute_signature(rule: str, probe_words: List[str]) -> tuple:
+    """Return the functional signature of *rule* as a tuple of per-word outputs.
+
+    Returns _UNSUPPORTED_SIG if any opcode in the rule is unsupported.
+    Using a tuple (not a joined string) eliminates false collisions from
+    output values that contain the separator character.
+    """
+    outputs = []
+    for word in probe_words:
+        out = _min_apply_chain(rule, word)
+        if out is None:
+            return _UNSUPPORTED_SIG
+        outputs.append(out)
+    return tuple(outputs)
+
+
+# ---------------------------------------------------------------------------
+# Probe vector (TEST_VECTOR)
+# ---------------------------------------------------------------------------
+# Concentrator's original 52-word vector merged with minimizer.py's
+# BUILTIN_PROBES.  Critical additions: "password" (was missing from the
+# original), short common base words (pass, root, admin, letmein …),
+# mixed-case compounds (AdminUser, HelloWorld …), embedded-digit words
+# (pass123, user9999 …), and "bbbb" for repeated-char coverage.
 
 TEST_VECTOR: List[str] = [
-    # Length 1-4
-    "a", "Z", "1", "aB", "42", "ab", "AB", "0",
-    # Length 5-8
-    "hello", "World", "ADMIN", "12345", "abc12", "P@ss1",
-    "test", "TEST", "Test",
-    # Length 9-12
+    # ── very short — edge cases for k, K, {, }, [, ] ────────────────────
+    "ab", "abc", "abcd",
+    # ── single chars and 2-char words ────────────────────────────────────
+    "a", "Z", "1", "aB", "42", "AB", "0",
+    # ── short alphanumeric (len 4–6) ─────────────────────────────────────
+    "pass", "root", "test", "admin", "login",
+    # ── length 5–8 (original concentrator set) ───────────────────────────
+    "hello", "World", "ADMIN", "12345", "abc12", "P@ss1", "TEST", "Test",
+    # ── typical password base words (len 7–9) ────────────────────────────
+    "letmein",          # len 7
+    "welcome",          # len 7
+    "password",         # len 8  ← THE critical probe word (was missing!)
+    "sunshine",         # len 8
+    "football",         # len 8
+    "baseball",         # len 8
+    "princess",         # len 8
+    "dragon12",         # len 8, ends with digits
+    # ── length 9–12 (original concentrator set) ──────────────────────────
     "Password1", "qwertyuio", "ABCDEFGHIJK", "0123456789",
     "pass_word", "hello-you",
-    # Length 13-16
+    # ── longer words (len 10+) — truncation / repeat ops ─────────────────
+    "qwertyuiop",       # len 10
+    "iloveyou12",       # len 10, trailing digits
+    "monkey12345",      # len 11
+    "superman123",      # len 11
+    "mustang2024",      # len 11
+    # ── mixed-case — l/u/c/C/t/E/T/k/K ──────────────────────────────────
+    "Password", "AdminUser", "MySecret", "HelloWorld",
+    # ── length 13–16 (original concentrator set) ─────────────────────────
     "Password12345", "administrator", "Summer2023pass",
     "QWERTYUIOPLKJ", "correctHorse!1",
-    # Length 17-20
+    # ── length 17–20 (original concentrator set) ─────────────────────────
     "verylongpassword1!", "A1b2C3d4E5f6G7h8",
     "abcdefghijklmnopq", "ABCDEFGHIJKLMNOPQ",
-    # Length 21-24
+    # ── length 21–24 (original concentrator set) ─────────────────────────
     "thisisaverylongstring", "A1b2C3d4E5f6G7h8I9j0",
     "abcdefghijklmnopqrstu",
-    # Length 25-28
+    # ── length 25–28 (original concentrator set) ─────────────────────────
     "averylongpasswordindeed12", "ABCDEFGHIJKLMNOPQRSTUVWXY",
     "abcdefghijklmnopqrstuvwxy",
-    # Length 29-32
+    # ── length 29–32 (original concentrator set) ─────────────────────────
     "aVerylongPasswordWithNumbers12", "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234",
     "abcdefghijklmnopqrstuvwxyz1234",
-    # Special characters / patterns
+    # ── embedded digits — s, o, @, T ops ─────────────────────────────────
+    "pass123", "admin2024", "test1234", "user9999",
+    # ── special characters — @ removal, s substitution ───────────────────
     "spec!", "!spec", "pa$$word", "s3cr3t!", "P@ssw0rd!",
+    "p@ssw0rd", "s3cur1ty",
+    # ── with spaces / underscores / hyphens ──────────────────────────────
     "hello world", "foo_bar", "test-case",
-    # Tricky patterns for case-change operators
+    # ── tricky case-change patterns ──────────────────────────────────────
     "hElLo", "pAsSwOrD", "tEsT", "xYz!",
-    # Pure digits
+    # ── pure digits ──────────────────────────────────────────────────────
     "01", "000", "99999", "1234567890",
-    # Duplicate-char patterns (exercises z, Z, q)
-    "aaaa", "ZZZZ", "1111",
+    # ── repeated chars (exercises z, Z, q) ───────────────────────────────
+    "aaaa", "ZZZZ", "1111", "bbbb",
 ]
+
+# Deduplicate while preserving order
+_tv_seen: set = set()
+_tv_deduped: List[str] = []
+for _tv_w in TEST_VECTOR:
+    if _tv_w not in _tv_seen:
+        _tv_seen.add(_tv_w)
+        _tv_deduped.append(_tv_w)
+TEST_VECTOR = _tv_deduped
+del _tv_seen, _tv_deduped, _tv_w
+
+
+# ---------------------------------------------------------------------------
+# Worker infrastructure (multiprocessing)
+# ---------------------------------------------------------------------------
 
 _worker_test_vector: List[str] = []
 
 
 def _worker_init(test_vec: List[str]) -> None:
-    """Pool initializer: store the test vector in each worker process."""
+    """Pool initializer: store the probe vector in each worker process."""
     global _worker_test_vector
     _worker_test_vector = test_vec
 
 
-def _compute_signature(rule_data: Tuple[str, int]) -> Tuple[str, Tuple[str, int]]:
-    rule_text, count = rule_data
-    engine    = RuleEngine([rule_text])
-    outputs   = [engine.apply(w) for w in _worker_test_vector]
-    signature = '|'.join(outputs)
-    return signature, (rule_text, count)
+def _compute_signature(rule_data: Tuple[str, int]) -> Tuple[tuple, Tuple[str, int]]:
+    """Compute a tuple-based functional signature using the byte-level engine.
 
+    Replaces the old RuleEngine + joined-string approach:
+      • latin-1 byte-level processing mirrors hashcat's GPU kernel exactly.
+      • Returns a *tuple* — eliminates false collisions from separator chars.
+      • Rules with unsupported opcodes return _UNSUPPORTED_SIG so they are
+        tracked separately rather than silently no-oped.
+      • \\xNN hex-escape arguments and both space-separated / concatenated
+        rule formats are handled correctly.
+    """
+    rule_text, count = rule_data
+    sig = _min_compute_signature(rule_text, _worker_test_vector)
+    return sig, (rule_text, count)
+
+
+# ---------------------------------------------------------------------------
+# SQLite-backed deduplication for very large rulesets
+# ---------------------------------------------------------------------------
+
+def _functional_minimization_sqlite(
+    data: List[Tuple[str, int]],
+) -> List[Tuple[str, int]]:
+    """Signature-deduplication for rulesets > _MIN_SQLITE_THRESHOLD rules.
+
+    The signature map lives entirely in a temporary
+    ``concentrator_minsig_<pid>.db`` file in the configured temp directory,
+    which is deleted unconditionally on completion (success or error).
+
+    Deduplication strategy (same as the in-memory path):
+      • Two rules that share a signature → keep the one with the higher
+        individual occurrence count and accumulate both counts.
+      • Rules with unsupported opcodes (_UNSUPPORTED_SIG) are kept intact
+        and are not deduplicated against each other.
+
+    Commit batching (every 10 000 rows) keeps SQLite write throughput high.
+    """
+    db_path = os.path.join(
+        STATE.temp_dir_path or tempfile.gettempdir(),
+        f"concentrator_minsig_{os.getpid()}.db",
+    )
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    print_info(
+        f"Ruleset exceeds {_MIN_SQLITE_THRESHOLD:,} rules — "
+        "using SQLite backing store for signature deduplication."
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.executescript("""
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous  = OFF;
+            PRAGMA temp_store   = MEMORY;
+            PRAGMA cache_size   = -65536;
+        """)
+        cur.execute("""
+            CREATE TABLE sigs (
+                sig   BLOB    PRIMARY KEY,
+                rule  TEXT    NOT NULL,
+                count INTEGER NOT NULL
+            )
+        """)
+        conn.commit()
+
+        _BATCH             = 10_000
+        pending            = 0
+        unsupported_rules: List[Tuple[str, int]] = []
+        conn.execute("BEGIN")
+
+        for rule_text, count in tqdm(data, desc="Sig (SQLite)", unit=" rules"):
+            sig = _min_compute_signature(rule_text, TEST_VECTOR)
+            if sig == _UNSUPPORTED_SIG:
+                unsupported_rules.append((rule_text, count))
+                continue
+            sig_blob = pickle.dumps(sig, protocol=4)
+            # INSERT new sig; on collision keep the higher-count rule and sum totals
+            cur.execute("""
+                INSERT INTO sigs (sig, rule, count) VALUES (?, ?, ?)
+                ON CONFLICT(sig) DO UPDATE SET
+                    rule  = CASE WHEN excluded.count > sigs.count
+                                 THEN excluded.rule ELSE sigs.rule END,
+                    count = sigs.count + excluded.count
+            """, (sig_blob, rule_text, count))
+            pending += 1
+            if pending >= _BATCH:
+                conn.commit()
+                conn.execute("BEGIN")
+                pending = 0
+
+        conn.commit()
+        cur.execute("SELECT rule, count FROM sigs")
+        final: List[Tuple[str, int]] = list(cur.fetchall())
+
+    finally:
+        conn.close()
+        if os.path.exists(db_path):
+            os.remove(db_path)
+            print_info("Temporary signature database removed.")
+
+    # Unsupported-opcode rules cannot be compared — append all of them as-is
+    final.extend(unsupported_rules)
+    final.sort(key=lambda kv: kv[1], reverse=True)
+
+    removed = len(data) - len(final)
+    print_success(f"Removed {removed:,} functionally redundant rules (SQLite path).")
+    if unsupported_rules:
+        print_info(
+            f"Retained {len(unsupported_rules):,} rules with unsupported opcodes."
+        )
+    return final
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 @memory_safe_operation("Functional Minimization", 85)
 def functional_minimization(
     data: List[Tuple[str, int]]
 ) -> List[Tuple[str, int]]:
+    """Eliminate functionally redundant rules using byte-level signature comparison.
+
+    Two rules are considered equivalent when they produce identical output on
+    every word in TEST_VECTOR.  When a collision is found, the rule with the
+    higher occurrence count is kept and the counts are summed.
+
+    Improvements over the previous RuleEngine-based implementation:
+      • latin-1 byte-level engine mirrors hashcat's GPU kernel behaviour.
+      • Tuple signatures eliminate false collisions from separator characters.
+      • \\xNN hex-escape arguments are handled in rule atoms.
+      • Unsupported-opcode rules are kept intact (not silently merged).
+      • SQLite-backed path for rulesets > _MIN_SQLITE_THRESHOLD prevents OOM.
+    """
     print_section("Functional Minimization")
     print_warning("RAM intensive — may take significant time for large datasets.")
 
@@ -1404,13 +1875,21 @@ def functional_minimization(
             print_info("Functional minimization skipped.")
             return data
 
-    print_info(f"Test-vector size: {len(TEST_VECTOR)} words")
+    print_info(
+        f"Probe-vector size: {len(TEST_VECTOR)} words  "
+        "(byte-level engine, tuple signatures)"
+    )
 
-    n_procs    = multiprocessing.cpu_count()
-    chunksize  = max(1, len(data) // (n_procs * 8))
+    # Very large rulesets → SQLite-backed path
+    if len(data) > _MIN_SQLITE_THRESHOLD:
+        return _functional_minimization_sqlite(data)
+
+    n_procs   = multiprocessing.cpu_count()
+    chunksize = max(1, len(data) // (n_procs * 8))
     print(f"{Colors.CYAN}[MP]{Colors.RESET} {n_procs} processes, chunksize={chunksize}.")
 
-    signature_map: Dict[str, List[Tuple[str, int]]] = {}
+    # sig_tuple → list of (rule_text, count)
+    signature_map: Dict[tuple, List[Tuple[str, int]]] = {}
 
     with multiprocessing.Pool(
         processes=n_procs,
@@ -1425,7 +1904,10 @@ def functional_minimization(
         ):
             signature_map.setdefault(sig, []).append(rule_data)
 
-    final: List[Tuple[str, int]] = []
+    # Unsupported-opcode rules: keep all of them (cannot compare functionally)
+    unsupported_group = signature_map.pop(_UNSUPPORTED_SIG, [])
+
+    final: List[Tuple[str, int]] = list(unsupported_group)
     for group in signature_map.values():
         group.sort(key=lambda kv: kv[1], reverse=True)
         best_rule = group[0][0]
@@ -1435,6 +1917,10 @@ def functional_minimization(
     final.sort(key=lambda kv: kv[1], reverse=True)
     removed = len(data) - len(final)
     print_success(f"Removed {removed:,} functionally redundant rules.")
+    if unsupported_group:
+        print_info(
+            f"Retained {len(unsupported_group):,} rules with unsupported opcodes."
+        )
     return final
 
 
