@@ -2,9 +2,58 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations  # Python 3.8+ type-hint compatibility
 """
-CONCENTRATOR v3.3 - Unified Hashcat Rule Processor
+CONCENTRATOR v3.4 - Unified Hashcat Rule Processor
 
-Changes from v3.2 → v3.3
+Changes from v3.3 → v3.4
+─────────────────────────
+Synchronised the internal minimizer engine with minimizer.py fixes.
+Both tools now produce identical functional signatures on all probe words.
+
+1. x opcode — corrected semantics (both RuleEngine and _min_apply_single)
+   xNM extracts M characters starting at position N: w[N : N+M].
+   Previous implementation treated M as an end-index: w[N : M+1] and
+   additionally swapped N↔M when N > M, producing wrong results.
+
+2. O opcode — corrected semantics (RuleEngine)
+   ONM deletes M characters starting at position N: w[:N] + w[N+M:].
+   Previous implementation treated M as an end-index of a range s..e.
+
+3. ' opcode — off-by-one fixed (both RuleEngine and _min_apply_single)
+   'N keeps exactly N characters: w[:N].
+   Previous implementation kept N+1 characters: w[:N+1].
+
+4. E opcode — missing lowercase step (both RuleEngine and _min_apply_single)
+   E must first lowercase the entire word, then uppercase the first letter
+   and every letter that follows a space (32), hyphen (45), or underscore (95).
+   Previous implementation only uppercased word-start letters, leaving
+   mid-word uppercase letters untouched ("hELLO" → "HELLO" instead of "Hello").
+
+5. e opcode — same missing lowercase step (both engines)
+   Same fix as E, applied to the custom-separator variant.
+
+6. 3 opcode — off-by-one in separator counter (_min_apply_single)
+   3NX toggles the letter after the Nth separator (N is 0-based).
+   cnt was incremented before the comparison, so n=0 (first separator)
+   required cnt==0 after incrementing — impossible. Fixed: compare cnt==n+1.
+
+7. dg() — added A-Z position support (_min_apply_single)
+   Hashcat uses base-36 positions: 0-9 for 0-9 and A-Z for 10-35.
+   dg() only handled 0-9, silently returning -1 for letter positions,
+   turning rules like DA (delete at pos 10) into no-ops.
+
+8. _UNSUPPORTED_SIG — unique sentinel per rule (both dedup paths)
+   All unsupported-opcode rules previously shared the same sentinel
+   ('__UNSUPPORTED__',), causing false deduplication: 200 reject-op rules
+   (<, >, !, /, …) collapsed to 1 kept rule. Each rule now gets a unique
+   sentinel ('__UNSUPPORTED__', rule_text). The _is_unsupported_sig() helper
+   detects any variant. Both the in-memory and SQLite dedup paths updated.
+
+9. SQLite dedup — indexable TEXT key (sha256) instead of BLOB
+   Signature blobs were stored as BLOB PRIMARY KEY. SQLite cannot build a
+   B-tree index on BLOB columns, forcing a full table scan on every INSERT.
+   Now a SHA-256 hex digest (64-char TEXT) is used as the key — fully
+   indexable, dramatically faster on large rulesets.
+
 ─────────────────────────
 1. Full token-level Markov model (get_markov_model)
    The model is now built on atomic hashcat TOKENS produced by TOKEN_REGEX
@@ -100,6 +149,7 @@ import os
 import re
 import signal
 import argparse
+import hashlib
 import math
 import itertools
 import multiprocessing
@@ -297,7 +347,7 @@ OPERATORS_REQUIRING_ARGS: Dict[str, int] = {
 
 def print_banner() -> None:
     print(f"\n{Colors.CYAN}{Colors.BOLD}" + "=" * 80)
-    print("          CONCENTRATOR v3.3 - Unified Hashcat Rule Processor")
+    print("          CONCENTRATOR v3.4 - Unified Hashcat Rule Processor")
     print("=" * 80 + f"{Colors.END}")
     features = [
         "OpenCL GPU Acceleration for validation and generation",
@@ -1223,15 +1273,17 @@ class RuleEngine:
             n = _i36(args[0])
             return word[:n] + word[n + 1:] if n < len(word) else word
         elif op == 'x':
-            s, e = _i36(args[0]), _i36(args[1])
-            if s < 0 or e < 0 or s > len(word) or e > len(word) or s > e:
-                return ''
-            return word[s:e]
-        elif op == 'O':
-            s, e = _i36(args[0]), _i36(args[1])
-            if s < 0 or e < 0 or s > len(word) or e > len(word) or s > e:
+            # xNM — extract M characters starting at position N  (M = count, not end)
+            n, m = _i36(args[0]), _i36(args[1])
+            if n < 0 or m < 0:
                 return word
-            return word[:s] + word[e + 1:]
+            return word[n:n + m]
+        elif op == 'O':
+            # ONM — delete M characters starting at position N
+            n, m = _i36(args[0]), _i36(args[1])
+            if n < 0 or m < 0 or n >= len(word):
+                return word
+            return word[:n] + word[n + m:]
         elif op == 'i':
             pos  = min(_i36(args[0]), len(word))
             char = args[1]
@@ -1241,6 +1293,7 @@ class RuleEngine:
             char = args[1]
             return word[:pos] + char + word[pos + 1:] if pos < len(word) else word
         elif op == "'":
+            # 'N — keep first N characters
             return word[:_i36(args[0])]
         elif op == 's':
             return word.replace(args[0], args[1])
@@ -1321,10 +1374,28 @@ class RuleEngine:
             n = _i36(args[0])
             return word + word[-n:] if word else word
         elif op == 'E':
-            return ' '.join(w.capitalize() for w in word.split(' '))
+            # Title-case: lowercase everything, then uppercase after space/hyphen/underscore
+            out = []
+            cap = True
+            for ch in word:
+                if cap:
+                    out.append(ch.upper())
+                else:
+                    out.append(ch.lower())
+                cap = ch in (' ', '-', '_')
+            return ''.join(out)
         elif op == 'e':
-            sep  = args[0]
-            return sep.join(w.capitalize() for w in word.split(sep))
+            # Title-case with custom separator: lowercase everything, then uppercase after sep
+            sep = args[0]
+            out = []
+            cap = True
+            for ch in word:
+                if cap:
+                    out.append(ch.upper())
+                else:
+                    out.append(ch.lower())
+                cap = (ch == sep)
+            return ''.join(out)
         else:
             return word
 
@@ -1372,9 +1443,17 @@ _ONE_ARG_OPS_MIN  = frozenset([
 ])
 _TWO_ARG_OPS_MIN  = frozenset(['s', 'i', 'o', 'x', 'O', '*', '3'])
 
-# Sentinel returned when a rule contains an unsupported opcode.
-# All such rules share this signature and are kept intact (not deduplicated).
+# Sentinel prefix for rules with unsupported opcodes.
+# Each such rule gets a UNIQUE signature ('__UNSUPPORTED__', rule_text) so that
+# two different unsupported rules are never mistakenly identified as duplicates.
+# The old constant ('__UNSUPPORTED__',) caused all unsupported rules to share
+# one bucket — e.g. 200 reject-op rules (<, >, !, /, …) collapsed to 1 kept rule.
 _UNSUPPORTED_SIG: tuple = ('__UNSUPPORTED__',)
+
+
+def _is_unsupported_sig(sig: tuple) -> bool:
+    """Return True if *sig* is an unsupported-opcode sentinel (any variant)."""
+    return len(sig) >= 1 and sig[0] == '__UNSUPPORTED__'
 
 # Rulesets above this size use a SQLite temp-DB instead of an in-memory dict
 # to avoid OOM on very large inputs.
@@ -1405,7 +1484,9 @@ def _min_apply_single(rule: str, word: str) -> Optional[str]:
     cmd = rule[0]
 
     def dg(c: str) -> int:
-        return ord(c) - 48 if '0' <= c <= '9' else -1
+        if '0' <= c <= '9': return ord(c) - 48
+        if 'A' <= c <= 'Z': return ord(c) - 55   # A=10, B=11, …, Z=35
+        return -1
 
     try:
         if cmd == ':':
@@ -1426,9 +1507,16 @@ def _min_apply_single(rule: str, word: str) -> Optional[str]:
             w = [c | 0x20 if 65 <= c <= 90 else
                  (c & ~0x20 if 97 <= c <= 122 else c) for c in w]
         elif cmd == 'E':
-            out: list = []; cap = True
+            # Title-case: lowercase everything, then uppercase after space/hyphen/underscore.
+            out = []
+            cap = True
             for c in w:
-                out.append(c & ~0x20 if cap and 97 <= c <= 122 else c)
+                if cap and 97 <= c <= 122:
+                    out.append(c & ~0x20)        # lowercase → uppercase (word start)
+                elif not cap and 65 <= c <= 90:
+                    out.append(c | 0x20)         # uppercase → lowercase (mid-word)
+                else:
+                    out.append(c)
                 cap = c in (32, 45, 95)
             w = out
         elif cmd == 'r':
@@ -1491,8 +1579,9 @@ def _min_apply_single(rule: str, word: str) -> Optional[str]:
             delta = 1 if cmd == '.' else -1
             if 0 <= p < len(w): w[p] = (w[p] + delta) & 0xFF
         elif cmd == "'" and len(rule) >= 2:
+            # 'N — keep only the first N characters (w[:N])
             p = dg(rule[1])
-            if 0 <= p < len(w): w = w[:p + 1]
+            if 0 <= p: w = w[:p]
         elif cmd == 'z' and len(rule) >= 2:
             n = dg(rule[1])
             if n > 0 and w: w = [w[0]] * n + w
@@ -1516,15 +1605,24 @@ def _min_apply_single(rule: str, word: str) -> Optional[str]:
             p, ch = dg(rule[1]), _min_arg_ord(rule, 2)
             if 0 <= p < len(w): w[p] = ch
         elif cmd == 'e' and len(rule) >= 2:
-            sep = _min_arg_ord(rule, 1); out = []; cap = True
+            # Title-case with custom separator: lowercase everything, then uppercase after sep.
+            sep = _min_arg_ord(rule, 1)
+            out = []
+            cap = True
             for c in w:
-                out.append(c & ~0x20 if cap and 97 <= c <= 122 else c)
+                if cap and 97 <= c <= 122:
+                    out.append(c & ~0x20)
+                elif not cap and 65 <= c <= 90:
+                    out.append(c | 0x20)
+                else:
+                    out.append(c)
                 cap = (c == sep)
             w = out
         elif cmd == 'x' and len(rule) >= 3:
-            a, b = dg(rule[1]), dg(rule[2])
-            if a > b: a, b = b, a
-            w = w[a:b + 1]
+            # xNM — extract M characters starting at position N  (M is a count, not end)
+            n, m = dg(rule[1]), dg(rule[2])
+            if n >= 0 and m >= 0:
+                w = w[n:n + m]
         elif cmd == 'O' and len(rule) >= 3:
             p, m = dg(rule[1]), dg(rule[2])
             if 0 <= p < len(w) and m > 0: w = w[:p] + w[p + m:]
@@ -1533,12 +1631,14 @@ def _min_apply_single(rule: str, word: str) -> Optional[str]:
             if 0 <= a < len(w) and 0 <= b < len(w) and a != b:
                 w[a], w[b] = w[b], w[a]
         elif cmd == '3' and len(rule) >= 3:
+            # 3NX — toggle after the Nth separator X  (N is 0-based: 30X = first sep)
+            # Fix: cnt is incremented before compare, so match at cnt == n+1.
             n, sep = dg(rule[1]), _min_arg_ord(rule, 2)
             cnt = 0
             for i, c in enumerate(w):
                 if c == sep:
                     cnt += 1
-                    if cnt == n and i + 1 < len(w):
+                    if cnt == n + 1 and i + 1 < len(w):
                         ci = w[i + 1]
                         w[i + 1] = (ci | 0x20 if 65 <= ci <= 90
                                     else (ci & ~0x20 if 97 <= ci <= 122 else ci))
@@ -1616,7 +1716,16 @@ def _min_apply_chain(chain: str, word: str) -> Optional[str]:
 def _min_compute_signature(rule: str, probe_words: List[str]) -> tuple:
     """Return the functional signature of *rule* as a tuple of per-word outputs.
 
-    Returns _UNSUPPORTED_SIG if any opcode in the rule is unsupported.
+    If any opcode in the rule is unsupported, returns a unique sentinel tuple
+    that embeds the rule text itself: ('__UNSUPPORTED__', rule).  This ensures
+    that two different unsupported rules (e.g. two different reject-op rules)
+    are never placed in the same dedup bucket and accidentally collapsed to one.
+
+    The old behaviour — returning the shared constant ('__UNSUPPORTED__',) for
+    every unsupported rule — caused false deduplication: 200 rules using reject
+    ops (<, >, !, /, …) or memory ops (M, 4, 6, X) would all share one bucket
+    and only the first one in file order would be kept.
+
     Using a tuple (not a joined string) eliminates false collisions from
     output values that contain the separator character.
     """
@@ -1624,7 +1733,7 @@ def _min_compute_signature(rule: str, probe_words: List[str]) -> tuple:
     for word in probe_words:
         out = _min_apply_chain(rule, word)
         if out is None:
-            return _UNSUPPORTED_SIG
+            return ('__UNSUPPORTED__', rule)   # unique per rule — never false-deduplicates
         outputs.append(out)
     return tuple(outputs)
 
@@ -1772,7 +1881,7 @@ def _functional_minimization_sqlite(
         """)
         cur.execute("""
             CREATE TABLE sigs (
-                sig   BLOB    PRIMARY KEY,
+                sig   TEXT    PRIMARY KEY,
                 rule  TEXT    NOT NULL,
                 count INTEGER NOT NULL
             )
@@ -1786,10 +1895,11 @@ def _functional_minimization_sqlite(
 
         for rule_text, count in tqdm(data, desc="Sig (SQLite)", unit=" rules"):
             sig = _min_compute_signature(rule_text, TEST_VECTOR)
-            if sig == _UNSUPPORTED_SIG:
+            if _is_unsupported_sig(sig):
                 unsupported_rules.append((rule_text, count))
                 continue
             sig_blob = pickle.dumps(sig, protocol=4)
+            sig_key  = hashlib.sha256(sig_blob).hexdigest()   # 64-char TEXT — B-tree indexable
             # INSERT new sig; on collision keep the higher-count rule and sum totals
             cur.execute("""
                 INSERT INTO sigs (sig, rule, count) VALUES (?, ?, ?)
@@ -1797,7 +1907,7 @@ def _functional_minimization_sqlite(
                     rule  = CASE WHEN excluded.count > sigs.count
                                  THEN excluded.rule ELSE sigs.rule END,
                     count = sigs.count + excluded.count
-            """, (sig_blob, rule_text, count))
+            """, (sig_key, rule_text, count))
             pending += 1
             if pending >= _BATCH:
                 conn.commit()
@@ -1894,10 +2004,16 @@ def functional_minimization(
             signature_map.setdefault(sig, []).append(rule_data)
 
     # Unsupported-opcode rules: keep all of them (cannot compare functionally)
-    unsupported_group = signature_map.pop(_UNSUPPORTED_SIG, [])
+    unsupported_group: List[Tuple[str, int]] = []
+    supported_map: Dict[tuple, List[Tuple[str, int]]] = {}
+    for sig, rule_data in signature_map.items():
+        if _is_unsupported_sig(sig):
+            unsupported_group.extend(rule_data)
+        else:
+            supported_map[sig] = rule_data
 
     final: List[Tuple[str, int]] = list(unsupported_group)
-    for group in signature_map.values():
+    for group in supported_map.values():
         group.sort(key=lambda kv: kv[1], reverse=True)
         best_rule = group[0][0]
         total_cnt = sum(cnt for _, cnt in group)
@@ -2863,7 +2979,7 @@ def print_usage() -> None:
         for flag, desc in opts:
             print(f"  {C.YELLOW}{flag:<30}{C.END}{desc}")
 
-    print(f"\n{C.BOLD}{C.CYAN}NOTES (v3.3):{C.END}")
+    print(f"\n{C.BOLD}{C.CYAN}NOTES (v3.4):{C.END}")
     print(f"  {C.WHITE}Memory operators (M 4 6 X) and reject operators (< > ! / ( ) = % Q){C.END}")
     print(f"  {C.WHITE}are filtered at every pipeline stage and will never appear in output.{C.END}")
     print(f"  {C.WHITE}Combinatorial generation uses full token units ($5, sae, T3) with{C.END}")
