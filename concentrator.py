@@ -2458,7 +2458,8 @@ def enhanced_interactive_processing_loop(
             print(f" {Colors.GREEN}(3){Colors.RESET} Filter by FUNCTIONAL REDUNDANCY [RAM intensive]")
             print(f" {Colors.GREEN}(4){Colors.RESET} INVERSE MODE – keep rules BELOW the cut-off rank")
             print(f" {Colors.GREEN}(5){Colors.RESET} HASHCAT CLEANUP – validate (CPU/GPU modes)")
-            print(f" {Colors.GREEN}(6){Colors.RESET} LEVENSHTEIN FILTER – remove similar rules")
+            print(f" {Colors.GREEN}(6){Colors.RESET} LEVENSHTEIN FILTER – remove similar rules"
+                  f"  {Colors.BG_RED}{Colors.BOLD}[EXPERIMENTAL – may destroy valid ruleset diversity]{Colors.END}")
             print(f" {Colors.GREEN}(7){Colors.RESET} TOGGLE OUTPUT FORMAT (currently: {STATE.output_format})")
             print(f"\n{Colors.BOLD}ANALYSIS & UTILITIES:{Colors.RESET}")
             print(f" {Colors.BLUE}(p){Colors.RESET} PARETO analysis")
@@ -2527,11 +2528,24 @@ def enhanced_interactive_processing_loop(
                 mode = 1 if m == '1' else 2
                 current_data = hashcat_rule_cleanup(current_data, mode)
             elif choice == '6':
-                result = levenshtein_filter(
-                    current_data, getattr(args, 'levenshtein_max_dist', 2)
-                )
-                if result is not None:
-                    current_data = result
+                print(f"\n{Colors.BG_RED}{Colors.BOLD}{Colors.WHITE}"
+                      f"  ⚠  HIGHLY EXPERIMENTAL MODE  ⚠  {Colors.END}")
+                print(f"{Colors.RED}  This filter compares rules as raw text strings, NOT by function.{Colors.END}")
+                print(f"{Colors.RED}  Functionally distinct rules may be removed simply because they look{Colors.END}")
+                print(f"{Colors.RED}  similar on the surface. Small max-distance values (≤2) are especially{Colors.END}")
+                print(f"{Colors.RED}  aggressive and can silently destroy valuable ruleset diversity.{Colors.END}")
+                print(f"{Colors.YELLOW}  Use 'r' (RESET) afterwards if results are unsatisfactory.{Colors.END}\n")
+                if not get_yes_no(
+                    f"{Colors.YELLOW}Proceed with Levenshtein filtering?{Colors.END}",
+                    default=False
+                ):
+                    print_info("Levenshtein filtering cancelled.")
+                else:
+                    result = levenshtein_filter(
+                        current_data, getattr(args, 'levenshtein_max_dist', 2)
+                    )
+                    if result is not None:
+                        current_data = result
             elif choice == '7':
                 STATE.output_format = 'expanded' if STATE.output_format == 'line' else 'line'
                 print_success(f"Output format → {STATE.output_format}")
