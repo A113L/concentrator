@@ -9,8 +9,7 @@
 - **OpenCL GPU Acceleration** — Batch rule validation offloaded to GPU for high throughput
 - **Three Processing Modes** — Extraction, Combinatorial generation, and Markov-based generation
 - **Hashcat Rule Engine Simulation** — Full CPU-side implementation of hashcat's rule operators
-- **Functional Minimization** — Deduplicate rules that produce identical outputs
-- **Levenshtein Distance Filtering** — Remove near-duplicate rules by edit distance
+- **Functional Minimization** — Deduplicate rules that produce identical outputs across a shared probe-word vector
 - **Memory Safety** — Monitors RAM/swap usage with configurable thresholds and disk-spill mode
 - **Multiple Output Formats** — `line` (compact) or `expanded` (operator + args separated by spaces)
 - **Interactive & CLI Modes** — Guided wizard or full argument-driven usage
@@ -102,17 +101,22 @@ python concentrator.py -g -n 50000 -l 2 4 hashcat/rules/
 ---
 
 ### `-gm` / `--generate-markov-rules` — Markov Mode
-Generate statistically probable rules using a Markov chain model trained on the input rule files.
+Generate statistically probable rules using a second-order token-level Markov model trained on the input rule files.
+
+Each walk samples a target length **uniformly** from `[min, max]`, producing an even distribution of short and long rules across the full range. The length breakdown is printed after generation.
 
 ```bash
 # Generate 10k Markov rules of length 1–5
 python concentrator.py -gm -gt 10000 -ml 1 5 hashcat/rules/
+
+# Generate 25k rules covering lengths 1–6
+python concentrator.py -gm -gt 25000 -ml 1 6 hashcat/rules/
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `-gt`, `--generate-target` | `10000` | Target number of rules to generate |
-| `-ml`, `--markov-length` | `1 3` | Min and max rule length |
+| `-ml`, `--markov-length` | `1 3` | Min and max rule length (in tokens/operators) |
 
 ---
 
@@ -122,15 +126,31 @@ Load, validate, deduplicate, and functionally minimize existing rule sets intera
 ```bash
 # Process rules using disk mode to avoid RAM exhaustion
 python concentrator.py -p -d rules/
-
-# Process with Levenshtein distance filtering (max dist 3)
-python concentrator.py -p -ld 3 rules/
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `-d`, `--use-disk` | off | Spill to disk instead of keeping everything in RAM |
-| `-ld`, `--levenshtein-max-dist` | `2` | Max edit distance for near-duplicate filtering |
+
+---
+
+## Interactive Processing Menu
+
+After loading or generating rules, an interactive menu is available with these options:
+
+| Key | Action |
+|---|---|
+| `1` | Filter by minimum occurrence count |
+| `2` | Keep top N rules |
+| `3` | Functional redundancy filter (RAM-intensive) |
+| `4` | Inverse mode — keep rules *below* a rank cutoff |
+| `5` | Hashcat cleanup — validate against CPU or GPU rule syntax |
+| `6` | Toggle output format (`line` ↔ `expanded`) |
+| `p` | Pareto analysis |
+| `s` | Save current ruleset |
+| `r` | Reset to original dataset |
+| `i` | Dataset information |
+| `q` | Quit |
 
 ---
 
@@ -181,24 +201,34 @@ You can pass individual files, directories, or a mix of both.
 
 ---
 
+## Filtered Operators
+
+The following operators are filtered at **every pipeline stage** and will never appear in output:
+
+| Category | Operators |
+|---|---|
+| Memory | `M` `4` `6` `X` |
+| Reject / Conditional | `<` `>` `!` `/` `(` `)` `=` `%` `Q` |
+
+---
+
 ## Supported Hashcat Rule Operators
 
 Concentrator validates and simulates the full hashcat rule operator set, including:
 
 | Category | Operators |
 |---|---|
-| Case | `l` `u` `c` `C` `t` `T` |
+| Case | `l` `u` `c` `C` `t` `T` `E` `e` |
 | Reverse / Duplicate | `r` `d` `f` `p` `q` |
 | Rotation | `{` `}` |
-| Trim | `[` `]` `D` `x` `O` |
+| Trim | `[` `]` `D` `x` `O` `'` |
 | Insert / Overwrite | `i` `o` `^` `$` |
-| Substitute / Delete | `s` `@` `!` `.` `,` |
+| Substitute / Delete | `s` `@` `.` `,` |
 | Extend | `z` `Z` `y` `Y` |
-| Memory | `M` `X` `4` `6` |
 | Arithmetic | `+` `-` `L` `R` |
-| Conditions / Length | `<` `>` `_` `=` `%` |
-| Leet / Replace | `e` `E` `3` |
-| Misc | `:` `k` `K` `Q` `*` |
+| Swap | `k` `K` `*` |
+| Leet / Separator | `3` |
+| Misc | `:` `_` |
 
 ---
 
@@ -211,8 +241,8 @@ python concentrator.py -e -t 5000 --no-gpu rules/*.rule
 # Generate 100k combinatorial rules, output in expanded format
 python concentrator.py -g -n 100000 -l 1 3 -f expanded hashcat/rules/ -ob my_rules
 
-# Markov generation with custom length range
-python concentrator.py -gm -gt 20000 -ml 2 4 hashcat/rules/
+# Markov generation across a wide length range
+python concentrator.py -gm -gt 25000 -ml 1 6 hashcat/rules/
 
 # Process and minimize rules, writing temp files to /tmp/scratch
 python concentrator.py -p -d --temp-dir /tmp/scratch rules/
@@ -229,6 +259,7 @@ python concentrator.py
 - If RAM usage exceeds **85%**, a warning is raised and you are prompted before continuing.
 - Use `--use-disk` / `-d` with `-p` mode to spill intermediate data to disk.
 - Use `--in-memory` to force full in-RAM processing (fastest, but watch your available memory).
+- Functional minimization uses a SQLite-backed path automatically for rulesets exceeding 1 million rules to prevent OOM.
 - Install `psutil` to enable memory monitoring.
 
 ---
