@@ -218,8 +218,8 @@ except ImportError:
 # GLOBAL STATE (minimal — prefer AppState below)
 # ==============================================================================
 
-_cleanup_lock = threading.Lock()
-_cleanup_in_progress = False
+_cleanup_lock              = threading.Lock()
+_cleanup_in_progress: bool = False
 _temp_files_to_cleanup: List[str] = []
 
 
@@ -235,7 +235,6 @@ class AppState:
     opencl_program: Any = None
 
 
-# Singleton application state
 STATE = AppState()
 
 
@@ -254,7 +253,7 @@ class Colors:
     BOLD      = '\033[1m'
     UNDERLINE = '\033[4m'
     END       = '\033[0m'
-    RESET     = '\033[0m'
+    RESET     = END   # alias — both mean "reset all attributes"
     BG_RED    = '\033[41m'
     BG_GREEN  = '\033[42m'
     BG_YELLOW = '\033[43m'
@@ -329,7 +328,9 @@ def _build_token_regex() -> re.Pattern:
 
 def _build_count_regex() -> re.Pattern:
     """Compile regex that matches any operator character (for counting)."""
-    patterns = sorted([re.escape(op) for op in ALL_OPERATORS], key=len, reverse=True)
+    # Single-char operators — length sorting is irrelevant, but keep for safety
+    patterns = [re.escape(op) for op in ALL_OPERATORS]
+    patterns.sort(key=len, reverse=True)
     return re.compile('|'.join(patterns))
 
 
@@ -354,7 +355,6 @@ def print_banner() -> None:
         "Three Processing Modes: Extraction, Combinatorial, Markov",
         "Hashcat Rule Engine Simulation & Functional Minimization",
         "Rule Validation and Cleanup (CPU/GPU compatible)",
-        "Levenshtein Distance Filtering",
         "Smart Processing Selection & Memory Safety",
         "Interactive & CLI Modes with Colorized Output",
         "Multiple output formats: line, expanded",
@@ -435,14 +435,14 @@ def cleanup_temp_files() -> None:
     if not _temp_files_to_cleanup:
         return
     print_info("Cleaning up temporary files...")
-    for fp in list(_temp_files_to_cleanup):
+    for fp in list(_temp_files_to_cleanup):  # snapshot — safe to mutate original during loop
         try:
             if os.path.exists(fp):
                 os.remove(fp)
                 print_info(f"Cleaned up: {fp}")
-            _temp_files_to_cleanup.remove(fp)
         except OSError:
             pass
+    _temp_files_to_cleanup.clear()
 
 
 def get_memory_usage() -> Optional[Dict[str, float]]:
@@ -747,12 +747,8 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
                 if not line or line.startswith('#') or len(line) > max_rule_length:
                     continue
                 clean = ''.join(c for c in line if c in ALL_RULE_CHARS)
-                if not clean:
+                if not clean or _has_banned_op(clean):
                     continue
-                # --- v3.1: drop memory/reject operators at load time ----------
-                if _has_banned_op(clean):
-                    continue
-                # --------------------------------------------------------------
                 full_rule_counts[clean] += 1
                 clean_rules.append(clean)
                 # v3.2: count full tokens (e.g. '$5', 'sae') not bare op chars
@@ -939,7 +935,7 @@ def get_markov_weighted_rules(
             continue  # rule does not tokenize cleanly
 
         logp  = 0.0
-        valid = True
+        skip  = False
 
         # ── Score first token ─────────────────────────────────────────────
         if tokens[0] not in markov_probabilities.get(START, {}):
@@ -962,10 +958,10 @@ def get_markov_weighted_rules(
                 if prev in markov_probabilities and tokens[i] in markov_probabilities[prev]:
                     logp += math.log(markov_probabilities[prev][tokens[i]])
                 else:
-                    valid = False
+                    skip = True
                     break
 
-        if valid:
+        if not skip:
             weighted.append((rule, logp))
 
     return sorted(weighted, key=lambda kv: kv[1], reverse=True)
@@ -1048,70 +1044,82 @@ def generate_rules_from_markov_model(
                 weights.append(prob)
         if not choices:
             return None
-        total = sum(weights)
-        if total == 0:
-            return None
-        return random.choices(choices, weights=[w / total for w in weights], k=1)[0]
+        # random.choices handles unnormalized weights natively — no need to
+        # pre-divide; avoids an extra O(n) pass over weights each call.
+        return random.choices(choices, weights=weights, k=1)[0]
 
     generated: Set[str] = set()
-    max_attempts = target * 20  # generous budget; most walks succeed
+    # Each walk now targets a RANDOMLY SAMPLED length from [min_len, max_len].
+    # This gives a uniform distribution of rule lengths across the full range.
+    # The old approach (extend to max_len, accept at every step) produced a
+    # heavy bias toward max_len: longer chains have exponentially more unique
+    # combinations and dominated `generated` first.
+    max_attempts = target * 20       # generous budget; most walks succeed
+    n_lengths    = max_len - min_len + 1
+    length_counts: Dict[int, int] = {l: 0 for l in range(min_len, max_len + 1)}
 
     for _ in range(max_attempts):
         if len(generated) >= target:
             break
 
-        # ── Step 1: Sample the first token ────────────────────────────────
+        # ── Step 1: Pick a target length uniformly from [min_len, max_len] ──
+        walk_target = random.randint(min_len, max_len)
+
+        # ── Step 2: Sample the first token ───────────────────────────────────
         first = _sample_next(START)
         if not first:
             continue
         token_seq: List[str] = [first]
 
-        # ── Step 2: Extend the token chain up to max_len ──────────────────
-        while len(token_seq) < max_len:
+        # ── Step 3: Extend to exactly walk_target tokens ─────────────────────
+        dead_end = False
+        while len(token_seq) < walk_target:
             # Prefer bigram context; fall back to unigram
             if len(token_seq) >= 2:
                 bigram_key = (token_seq[-2], token_seq[-1])
-                nxt = _sample_next(bigram_key)
-                if not nxt:
-                    nxt = _sample_next(token_seq[-1])
+                nxt = _sample_next(bigram_key) or _sample_next(token_seq[-1])
             else:
                 nxt = _sample_next(token_seq[-1])
 
             if not nxt:
-                break  # dead end — accept what we have if in range
+                dead_end = True
+                break
 
             token_seq.append(nxt)
 
-            # ── Step 3: Accept if token count is in [min_len, max_len] ────
-            if min_len <= len(token_seq) <= max_len:
-                rule = ''.join(token_seq)
+        # Dead-end walk that fell short of min_len: discard
+        if dead_end and len(token_seq) < min_len:
+            continue
 
-                # Paranoia guard: no banned operator must have slipped in
-                if _has_banned_op(rule):
-                    continue
-                # Round-trip validation: joined string must re-tokenise to
-                # the exact same token list (catches accidental merges)
-                if TOKEN_REGEX.findall(rule) != token_seq:
-                    continue
-                # Final syntactic gate
-                if gpu_mode:
-                    if HashcatRuleCleaner(2).validate_rule(rule):
-                        generated.add(rule)
-                elif is_valid_hashcat_rule(rule):
-                    generated.add(rule)
+        # ── Step 4: Validate and register the rule ───────────────────────────
+        rule = ''.join(token_seq)
 
-        # Also accept chain at min_len even if we broke out before max_len
-        if len(token_seq) >= min_len:
-            rule = ''.join(token_seq[:min_len])
-            if (not _has_banned_op(rule)
-                    and TOKEN_REGEX.findall(rule) == token_seq[:min_len]):
-                if gpu_mode:
-                    if HashcatRuleCleaner(2).validate_rule(rule):
-                        generated.add(rule)
-                elif is_valid_hashcat_rule(rule):
-                    generated.add(rule)
+        # Paranoia guard: no banned operator must have slipped in
+        if _has_banned_op(rule):
+            continue
+        # Round-trip validation: joined string must re-tokenise to the same
+        # token list (catches accidental multi-char merges at token boundaries)
+        if TOKEN_REGEX.findall(rule) != token_seq:
+            continue
+        # Final syntactic gate
+        valid = (
+            HashcatRuleCleaner(2).validate_rule(rule)
+            if gpu_mode
+            else is_valid_hashcat_rule(rule)
+        )
+        if valid and rule not in generated:
+            generated.add(rule)
+            length_counts[len(token_seq)] += 1
 
+    # ── Report generation results and length distribution ────────────────────
     print_success(f"Generated {len(generated):,} valid token-level Markov rules.")
+    if n_lengths > 1 and generated:
+        dist_parts = [
+            f"len={l}: {length_counts[l]:,}"
+            for l in range(min_len, max_len + 1)
+        ]
+        print_info("Length distribution: " + "  |  ".join(dist_parts))
+
     if not generated:
         return []
     dummy = {r: 1 for r in generated}
@@ -1797,15 +1805,8 @@ TEST_VECTOR: List[str] = [
     "bbbb",
 ]
 
-# Deduplicate while preserving order
-_tv_seen: set = set()
-_tv_deduped: List[str] = []
-for _tv_w in TEST_VECTOR:
-    if _tv_w not in _tv_seen:
-        _tv_seen.add(_tv_w)
-        _tv_deduped.append(_tv_w)
-TEST_VECTOR = _tv_deduped
-del _tv_seen, _tv_deduped, _tv_w
+# Deduplicate while preserving order (inline — no namespace pollution)
+TEST_VECTOR = list(dict.fromkeys(TEST_VECTOR))
 
 
 # ---------------------------------------------------------------------------
@@ -2030,82 +2031,6 @@ def functional_minimization(
 
 
 # ==============================================================================
-# LEVENSHTEIN FILTERING
-# ==============================================================================
-
-def levenshtein_distance(s1: str, s2: str, max_dist: Optional[int] = None) -> int:
-    if len(s1) < len(s2):
-        s1, s2 = s2, s1
-    if not s2:
-        return len(s1)
-
-    prev = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        cur = [i + 1]
-        row_min = i + 1
-        for j, c2 in enumerate(s2):
-            val = min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (c1 != c2))
-            cur.append(val)
-            if val < row_min:
-                row_min = val
-        if max_dist is not None and row_min > max_dist:
-            return row_min
-        prev = cur
-
-    return prev[-1]
-
-
-@memory_safe_operation("Levenshtein Filtering", 85)
-def levenshtein_filter(
-    data:         List[Tuple[str, int]],
-    max_distance: int = 2,
-) -> List[Tuple[str, int]]:
-    print_section("Levenshtein Filtering")
-    print_warning("Can be slow for large datasets.")
-
-    if not data:
-        return data
-
-    if len(data) > 5_000:
-        print_warning(f"Large dataset ({len(data):,} rules). This may take a while.")
-        if input(
-            f"{Colors.YELLOW}Continue? (y/N): {Colors.RESET}"
-        ).strip().lower() not in ('y', 'yes'):
-            return data
-
-    while True:
-        try:
-            raw = input(
-                f"{Colors.YELLOW}Enter max Levenshtein distance (1-10) [{max_distance}]: {Colors.RESET}"
-            ).strip()
-            if not raw:
-                break
-            v = int(raw)
-            if 1 <= v <= 10:
-                max_distance = v
-                break
-            print_error("Enter a value between 1 and 10.")
-        except ValueError:
-            print_error("Invalid number.")
-
-    unique:  List[Tuple[str, int]] = []
-    removed: int                   = 0
-
-    for rule, cnt in tqdm(data, desc="Levenshtein filtering"):
-        similar = any(
-            levenshtein_distance(rule, existing, max_dist=max_distance) <= max_distance
-            for existing, _ in unique
-        )
-        if similar:
-            removed += 1
-        else:
-            unique.append((rule, cnt))
-
-    print_success(f"Removed {removed:,} similar rules. Remaining: {len(unique):,}")
-    return unique
-
-
-# ==============================================================================
 # PARETO ANALYSIS
 # ==============================================================================
 
@@ -2150,12 +2075,17 @@ def display_pareto_curve(data: List[Tuple[str, int]]) -> None:
     print(f"\n{Colors.BOLD}PARETO CURVE (ASCII):{Colors.RESET}")
     pts  = 20
     step = max(1, len(data) // pts)
+    cum_running = 0
+    prev_idx    = -1
     for i in range(pts + 1):
-        idx     = min(i * step, len(data) - 1)
-        cum_val = sum(c for _, c in data[:idx + 1])
-        pct     = cum_val / total_value * 100
-        bar     = "█" * int(pct / 5)
-        y       = 100 - (i * 5)
+        idx = min(i * step, len(data) - 1)
+        # Accumulate only the delta since the last checkpoint
+        for j in range(prev_idx + 1, idx + 1):
+            cum_running += data[j][1]
+        prev_idx = idx
+        pct  = cum_running / total_value * 100
+        bar  = "█" * int(pct / 5)
+        y    = 100 - (i * 5)
         if y % 20 == 0 or i in (0, pts):
             print(f"{y:>4}% ┤ {bar}")
     print("    0% ┼" + "─" * 20)
@@ -2301,7 +2231,7 @@ def save_rules(
 
     try:
         with open(filename, 'w', encoding='utf-8') as fh:
-            fh.write(f"# CONCENTRATOR v3.3 – {mode_name.upper()} MODE OUTPUT\n")
+            fh.write(f"# CONCENTRATOR v3.4 – {mode_name.upper()} MODE OUTPUT\n")
             fh.write(f"# Generated:   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             fh.write(f"# Total rules: {len(clean_data):,}\n")
             fh.write(f"# Format:      {STATE.output_format}\n#\n")
@@ -2458,9 +2388,7 @@ def enhanced_interactive_processing_loop(
             print(f" {Colors.GREEN}(3){Colors.RESET} Filter by FUNCTIONAL REDUNDANCY [RAM intensive]")
             print(f" {Colors.GREEN}(4){Colors.RESET} INVERSE MODE – keep rules BELOW the cut-off rank")
             print(f" {Colors.GREEN}(5){Colors.RESET} HASHCAT CLEANUP – validate (CPU/GPU modes)")
-            print(f" {Colors.GREEN}(6){Colors.RESET} LEVENSHTEIN FILTER – remove similar rules"
-                  f"  {Colors.BG_RED}{Colors.BOLD}[EXPERIMENTAL – may destroy valid ruleset diversity]{Colors.END}")
-            print(f" {Colors.GREEN}(7){Colors.RESET} TOGGLE OUTPUT FORMAT (currently: {STATE.output_format})")
+            print(f" {Colors.GREEN}(6){Colors.RESET} TOGGLE OUTPUT FORMAT (currently: {STATE.output_format})")
             print(f"\n{Colors.BOLD}ANALYSIS & UTILITIES:{Colors.RESET}")
             print(f" {Colors.BLUE}(p){Colors.RESET} PARETO analysis")
             print(f" {Colors.BLUE}(s){Colors.RESET} SAVE current rules")
@@ -2471,7 +2399,7 @@ def enhanced_interactive_processing_loop(
             choice = input(f"{Colors.YELLOW}Enter choice: {Colors.RESET}").strip().lower()
 
             if choice == 'q':
-                print_header("THANK YOU FOR USING CONCENTRATOR v3.3!")
+                print_header("THANK YOU FOR USING CONCENTRATOR v3.4!")
                 break
 
             elif choice == 'p':
@@ -2528,25 +2456,6 @@ def enhanced_interactive_processing_loop(
                 mode = 1 if m == '1' else 2
                 current_data = hashcat_rule_cleanup(current_data, mode)
             elif choice == '6':
-                print(f"\n{Colors.BG_RED}{Colors.BOLD}{Colors.WHITE}"
-                      f"  ⚠  HIGHLY EXPERIMENTAL MODE  ⚠  {Colors.END}")
-                print(f"{Colors.RED}  This filter compares rules as raw text strings, NOT by function.{Colors.END}")
-                print(f"{Colors.RED}  Functionally distinct rules may be removed simply because they look{Colors.END}")
-                print(f"{Colors.RED}  similar on the surface. Small max-distance values (≤2) are especially{Colors.END}")
-                print(f"{Colors.RED}  aggressive and can silently destroy valuable ruleset diversity.{Colors.END}")
-                print(f"{Colors.YELLOW}  Use 'r' (RESET) afterwards if results are unsatisfactory.{Colors.END}\n")
-                if not get_yes_no(
-                    f"{Colors.YELLOW}Proceed with Levenshtein filtering?{Colors.END}",
-                    default=False
-                ):
-                    print_info("Levenshtein filtering cancelled.")
-                else:
-                    result = levenshtein_filter(
-                        current_data, getattr(args, 'levenshtein_max_dist', 2)
-                    )
-                    if result is not None:
-                        current_data = result
-            elif choice == '7':
                 STATE.output_format = 'expanded' if STATE.output_format == 'line' else 'line'
                 print_success(f"Output format → {STATE.output_format}")
                 continue
@@ -2554,7 +2463,7 @@ def enhanced_interactive_processing_loop(
                 print_error("Invalid choice.")
                 continue
 
-            if choice in ('1', '2', '3', '4', '5', '6'):
+            if choice in ('1', '2', '3', '4', '5'):
                 reduction = (
                     (orig_count - len(current_data)) / orig_count * 100
                     if orig_count else 0.0
@@ -2764,7 +2673,7 @@ def concentrator_main_processing(args: Any) -> None:
 # ==============================================================================
 
 def interactive_mode() -> Optional[Dict]:
-    print_header("CONCENTRATOR v3.3 – INTERACTIVE MODE")
+    print_header("CONCENTRATOR v3.4 – INTERACTIVE MODE")
     settings: Dict[str, Any] = {}
 
     print(f"\n{Colors.CYAN}Input Configuration:{Colors.END}")
@@ -2977,8 +2886,7 @@ def print_usage() -> None:
          [("-gt INT",     "Target rules (default: 10000)"),
           ("-ml MIN MAX", "Rule length range (default: 1 3)")]),
         ("PROCESSING (-p)",
-         [("-d",    "Use disk for large datasets"),
-          ("-ld INT", "Max Levenshtein distance (default: 2)")]),
+         [("-d",    "Use disk for large datasets")]),
         ("OUTPUT",
          [("-f FORMAT",  "Output format: line or expanded (default: line)"),
           ("-ob NAME",   "Base name for output file")]),
@@ -3092,7 +3000,6 @@ if __name__ == '__main__':
         parser.add_argument('-gt', '--generate_target', type=int, default=10000)
         parser.add_argument('-ml', '--markov_length',   nargs='+', type=int, default=None)
         parser.add_argument('-d',  '--use_disk',        action='store_true')
-        parser.add_argument('-ld', '--levenshtein_max_dist', type=int, default=2)
         parser.add_argument('-m',  '--max_length',      type=int, default=31)
         parser.add_argument('--temp-dir',  default=None)
         parser.add_argument('--in-memory', action='store_true')
