@@ -613,24 +613,112 @@ def set_global_flags(temp_dir_path: Optional[str], in_memory_mode: bool) -> None
 
 
 # ==============================================================================
-# RULE VALIDATION (CPU)
+# RULE VALIDATION (CPU) – replaced with rulest's logic
 # ==============================================================================
 
-def is_valid_hashcat_rule(rule: str) -> bool:
-    """Return True if *rule* is syntactically valid according to OPERATOR_ARGS."""
-    tokens = TOKEN_REGEX.findall(rule)
-    if ''.join(tokens) != rule:
+def should_exclude_rule(rule: str) -> bool:
+    """Return True if the rule uses an operator that is permanently excluded."""
+    if not rule:
         return False
-    for token in tokens:
-        op = token[0]
-        if op not in OPERATOR_ARGS:
-            return False
-        if len(token) != 1 + len(OPERATOR_ARGS[op]):
-            return False
-        for idx, arg_type in enumerate(OPERATOR_ARGS[op]):
-            if arg_type == 'num' and token[1 + idx] not in BASE36_CHARS:
+    # Single-character reject/memory ops
+    if len(rule) == 1 and rule in ('_', 'M', '4', '6', 'Q'):
+        return True
+    # Two-character reject ops (some have a digit, but we check only first char)
+    if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'):
+        return True
+    # Three-character reject ops (e.g. '=0', '%0', 'Q0')
+    if len(rule) == 3 and rule[0] in ('?', '=', 'v'):
+        return True
+    return False
+
+
+def is_valid_hashcat_rule(rule: str) -> bool:
+    """Return True if *rule* is syntactically valid according to rulest's validator.
+
+    This is a direct translation of HashcatRuleValidator.validate_rule_for_gpu
+    from rulest_v2.py, ensuring that concentrator's cleanup mode never discards
+    rules that rulest would accept.
+    """
+    # Quick rejection for permanently excluded operators
+    if should_exclude_rule(rule):
+        return False
+
+    pos = 0
+    cnt = 0
+    n = len(rule)
+
+    def is_digit(c: str) -> bool:
+        return '0' <= c <= '9'
+
+    while pos < n:
+        c = rule[pos]
+        if c == ' ':
+            pos += 1
+            continue
+        # p, z, Z: one optional digit
+        if c in ('p', 'z', 'Z'):
+            cnt += 1
+            pos += 1
+            if pos < n and is_digit(rule[pos]):
+                pos += 1
+            continue
+        # Zero-argument operators
+        if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'a', 'q', 'k', 'K',
+                 'E', '{', '}', '[', ']'):
+            pos += 1
+            cnt += 1
+            continue
+        # Operators with exactly one digit argument
+        if c in ('T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'y', 'Y'):
+            pos += 1
+            if pos >= n or not is_digit(rule[pos]):
                 return False
-    return True
+            pos += 1
+            cnt += 1
+            continue
+        # Operators with one digit and then one character (i, o, 3)
+        if c in ('i', 'o', '3'):
+            pos += 1
+            if pos >= n or not is_digit(rule[pos]):
+                return False
+            pos += 1
+            if pos >= n:
+                return False
+            pos += 1
+            cnt += 1
+            continue
+        # Operators with two digit arguments (x, *, O)
+        if c in ('x', '*', 'O'):
+            pos += 1
+            if pos >= n or not is_digit(rule[pos]):
+                return False
+            pos += 1
+            if pos >= n or not is_digit(rule[pos]):
+                return False
+            pos += 1
+            cnt += 1
+            continue
+        # s operator: two literal characters
+        if c == 's':
+            pos += 1
+            if pos + 1 >= n:
+                return False
+            pos += 2
+            cnt += 1
+            continue
+        # Operators with one literal character (^, $, @, e, etc.)
+        if c in ('@', 'e', '$', '^'):
+            pos += 1
+            if pos >= n:
+                return False
+            pos += 1
+            cnt += 1
+            continue
+        # Any other character is invalid
+        return False
+
+    # GPU rules limit (rulest uses MAX_GPU_RULES = 255)
+    return cnt <= 255
 
 
 # ==============================================================================
@@ -1101,11 +1189,11 @@ def generate_rules_from_markov_model(
         # token list (catches accidental multi-char merges at token boundaries)
         if TOKEN_REGEX.findall(rule) != token_seq:
             continue
-        # Final syntactic gate
+        # Final syntactic gate (now using rulest's validator)
         valid = (
-            HashcatRuleCleaner(2).validate_rule(rule)
-            if gpu_mode
-            else is_valid_hashcat_rule(rule)
+            is_valid_hashcat_rule(rule)
+            if not gpu_mode
+            else is_valid_hashcat_rule(rule)  # gpu_mode uses same validation
         )
         if valid and rule not in generated:
             generated.add(rule)
@@ -1177,7 +1265,7 @@ def _generate_for_length(args: Tuple) -> Set[str]:
             invalid_concat += 1
             continue
         if gpu_mode:
-            if not HashcatRuleCleaner(2).validate_rule(rule):
+            if not is_valid_hashcat_rule(rule):
                 continue
         generated.add(rule)
     return generated
@@ -2247,28 +2335,23 @@ def save_rules(
 
 
 # ==============================================================================
-# HASHCAT RULE CLEANUP — data-driven validator
+# HASHCAT RULE CLEANUP — using rulest's validator (replaces old HashcatRuleCleaner)
 # ==============================================================================
 
-_OP_VALIDATION_SPEC: Dict[str, List[str]] = {
-    ':': [], 'l': [], 'u': [], 'c': [], 'C': [], 't': [], 'r': [], 'd': [], 'f': [],
-    '{': [], '}': [], '[': [], ']': [], 'q': [], 'k': [], 'K': [], 'a': [], 'E': [],
-    'T': ['N'], 'p': ['N'], 'D': ['N'], 'z': ['N'], 'Z': ['N'], "'": ['N'],
-    'L': ['N'], 'R': ['N'], '+': ['N'], '-': ['N'], '.': ['N'], ',': ['N'],
-    'y': ['N'], 'Y': ['N'], '_': ['N'],
-    'x': ['N', 'N'], 'O': ['N', 'N'], '*': ['N', 'N'],
-    '$': ['C'], '^': ['C'], '@': ['C'], 'e': ['C'],
-    's': ['C', 'C'],
-    'i': ['N', 'C'], 'o': ['N', 'C'], '3': ['N', 'C'],
-}
-
+# The old _OP_VALIDATION_SPEC and HashcatRuleCleaner class are removed.
+# Instead, we reuse the is_valid_hashcat_rule() function defined above,
+# which exactly mirrors rulest's HashcatRuleValidator.validate_rule_for_gpu.
 
 class HashcatRuleCleaner:
     """
-    Validates hashcat rules against CPU or GPU compatibility constraints.
+    Validates hashcat rules using the same logic as rulest_v2.py.
 
-    v3.1: NEVER_PRODUCE_OPS operators are always rejected.
-    The _OP_VALIDATION_SPEC table no longer has entries for those operators.
+    v3.4: replaced the previous ad‑hoc table with a direct call to
+    is_valid_hashcat_rule(), which implements the complete rulest validator.
+    This ensures that rules produced by rulest are never wrongly discarded.
+
+    The `mode` argument is ignored – the validator is identical for CPU and GPU
+    (rulest's validator already enforces GPU compatibility with MAX_GPU_RULES=255).
     """
 
     MAX_RULES = 255
@@ -2276,46 +2359,20 @@ class HashcatRuleCleaner:
     def __init__(self, mode: int = 1) -> None:
         if mode not in (1, 2):
             raise ValueError("mode must be 1 (CPU) or 2 (GPU)")
-        self.mode = mode
+        self.mode = mode   # kept for API compatibility, but not used in validation
 
     @staticmethod
-    def _conv_ctoi(c: str) -> int:
-        if '0' <= c <= '9':
-            return ord(c) - ord('0')
-        if 'A' <= c <= 'Z':
-            return ord(c) - ord('A') + 10
-        return -1
-
-    def validate_rule(self, rule_line: str) -> bool:
-        clean = rule_line.replace(' ', '')
-        if not clean:
+    def validate_rule(rule_line: str) -> bool:
+        """Return True if the rule is syntactically valid according to rulest."""
+        # Trim surrounding spaces; rulest's validator does not expect spaces inside.
+        rule = rule_line.strip()
+        if not rule:
             return False
-
-        cnt  = 0
-        pos  = 0
-        n    = len(clean)
-
-        while pos < n:
-            op = clean[pos]
-
-            if op not in _OP_VALIDATION_SPEC:
-                return False
-
-            spec = _OP_VALIDATION_SPEC[op]
-            for kind in spec:
-                pos += 1
-                if pos >= n:
-                    return False
-                if kind == 'N' and self._conv_ctoi(clean[pos]) == -1:
-                    return False
-
-            cnt += 1
-            pos += 1
-
-            if cnt > self.MAX_RULES:
-                return False
-
-        return True
+        # Quick rejection: contains any NEVER_PRODUCE_OPS operator
+        if _has_banned_op(rule):
+            return False
+        # Use the rulest validator
+        return is_valid_hashcat_rule(rule)
 
     def clean_rules(
         self, rules_data: List[Tuple[str, int]]
@@ -2751,7 +2808,7 @@ def interactive_mode() -> Optional[Dict]:
         print(f"{Colors.YELLOW}  Recommended: Mode {rmap[recommended_mode]}{Colors.END}")
 
     while True:
-        choice = input(f"{Colors.YELLOW}Select mode (1-3): {Colors.END}").strip()
+        choice = input(f"{Colors.YELLOW}Select mode (1-3): {Colors.RESET}").strip()
         if choice == '1':
             settings['mode'] = 'extraction'; break
         elif choice == '2':
@@ -2815,7 +2872,7 @@ def interactive_mode() -> Optional[Dict]:
     print(f"  {Colors.GREEN}1{Colors.END} – Standard line")
     print(f"  {Colors.GREEN}2{Colors.END} – Expanded (space-separated operators)")
     while True:
-        fc = input(f"{Colors.YELLOW}Select (1-2): {Colors.END}").strip()
+        fc = input(f"{Colors.YELLOW}Select (1-2): {Colors.RESET}").strip()
         if fc == '1':
             settings['output_format'] = 'line';     break
         elif fc == '2':
@@ -2824,7 +2881,7 @@ def interactive_mode() -> Optional[Dict]:
             print_error("Enter 1 or 2.")
 
     if not settings['in_memory']:
-        td = input(f"{Colors.YELLOW}Temp directory [system default]: {Colors.END}").strip()
+        td = input(f"{Colors.YELLOW}Temp directory [system default]: {Colors.RESET}").strip()
         settings['temp_dir'] = td or None
     else:
         settings['temp_dir'] = None
