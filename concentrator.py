@@ -2,7 +2,34 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations  # Python 3.8+ type-hint compatibility
 """
-CONCENTRATOR v3.4 - Unified Hashcat Rule Processor
+CONCENTRATOR v3.5 - Unified Hashcat Rule Processor
+
+Changes from v3.4 → v3.5
+─────────────────────────
+1. Fourth-order token-level Markov model (get_markov_model)
+   Training now records four context lengths instead of two:
+
+     START → first_token                          key: '^'
+     token_i → token_{i+1}                        key: token_i        (unigram)
+     (token_{i-1}, token_i) → token_{i+1}         key: 2-tuple        (bigram)
+     (token_{i-2..i}) → token_{i+1}               key: 3-tuple        (trigram)
+     (token_{i-3..i}) → token_{i+1}               key: 4-tuple        (4-gram)
+
+   The summary printout now reports all four context counts separately:
+   "N unigram, M bigram, P trigram, Q 4-gram contexts."
+
+2. Extended scoring cascade (get_markov_weighted_rules)
+   Log-probability scoring now tries contexts in order of decreasing length:
+     4-gram → trigram → bigram → unigram
+   The longest available context wins at each position.  Rules scored under a
+   longer context receive higher discrimination; the cascade falls back
+   gracefully when the model is sparse (small corpus / short rules).
+
+3. Extended generation cascade (generate_rules_from_markov_model)
+   The random walk now uses the same 4-gram → trigram → bigram → unigram
+   cascade when extending a token sequence.  For default max_len=3 the
+   behaviour is identical to v3.4 (trigram/4-gram contexts cannot fire before
+   the walk terminates); the improvement is visible at max_len >= 5.
 
 Changes from v3.3 → v3.4
 ─────────────────────────
@@ -348,7 +375,7 @@ OPERATORS_REQUIRING_ARGS: Dict[str, int] = {
 
 def print_banner() -> None:
     print(f"\n{Colors.CYAN}{Colors.BOLD}" + "=" * 80)
-    print("          CONCENTRATOR v3.4 - Unified Hashcat Rule Processor")
+    print("          CONCENTRATOR v3.5 - Unified Hashcat Rule Processor")
     print("=" * 80 + f"{Colors.END}")
     features = [
         "OpenCL GPU Acceleration for validation and generation",
@@ -924,7 +951,7 @@ def analyze_rule_files_parallel(
 def get_markov_model(
     unique_rules: Dict[str, int]
 ) -> Tuple[Optional[Dict], Optional[Dict]]:
-    """Build a second-order token-level Markov model from a rule corpus.
+    """Build a fourth-order token-level Markov model from a rule corpus.
 
     The model operates on atomic hashcat TOKENS (as produced by TOKEN_REGEX),
     NOT on raw characters.  A token is the smallest meaningful unit of a
@@ -937,19 +964,28 @@ def get_markov_model(
       • min_len / max_len refer to operator counts, not byte lengths, which is
         the natural measure of rule complexity for hashcat.
 
-    Three transition tables are stored under the same 'probs' dict:
+    Five transition tables are stored under the same 'probs' dict:
 
-      START → first_token          key: '^'  (string)
-      token_i → token_{i+1}        key: token_i  (string, unigram context)
-      (token_{i-1}, token_i) →     key: (token_{i-1}, token_i)  (tuple, bigram context)
+      START → first_token                     key: '^'             (string)
+      token_i → token_{i+1}                   key: token_i         (1-tuple / unigram ctx)
+      (token_{i-1}, token_i) →                key: 2-tuple         (bigram ctx)
+          token_{i+1}
+      (token_{i-2}, token_{i-1}, token_i) →   key: 3-tuple         (trigram ctx)
+          token_{i+1}
+      (tok_{i-3}..token_i) →                  key: 4-tuple         (4-gram ctx)
           token_{i+1}
 
-    The bigram context is tried first during generation/scoring; the unigram
-    is used as a fallback when no bigram entry exists.
+    During generation and scoring the highest-order context that has an
+    observation is preferred; shorter contexts are used as fallbacks:
+        4-gram → trigram → bigram → unigram
+
+    Higher-order contexts improve rule quality when the training corpus is
+    large enough; for short rules (max_len ≤ 3) only unigram/bigram contexts
+    fire in practice, so the model degrades gracefully on small corpora.
     """
     if not memory_intensive_operation_warning("Markov model building"):
         return None, None
-    print_section("Building Token-Level Markov Sequence Probability Model")
+    print_section("Building Token-Level Markov Sequence Probability Model (up to 4-grams)")
     counts: Dict = defaultdict(lambda: defaultdict(int))
     START = '^'
     skipped = 0
@@ -961,15 +997,21 @@ def get_markov_model(
         if not tokens or ''.join(tokens) != rule:
             skipped += 1
             continue
+        n = len(tokens)
         # START → first token
         counts[START][tokens[0]] += 1
         # Unigram transitions: tokens[i] → tokens[i+1]
-        for i in range(len(tokens) - 1):
+        for i in range(n - 1):
             counts[tokens[i]][tokens[i + 1]] += 1
-        # Bigram transitions: (tokens[i], tokens[i+1]) → tokens[i+2]
-        for i in range(len(tokens) - 2):
-            bigram_key = (tokens[i], tokens[i + 1])
-            counts[bigram_key][tokens[i + 2]] += 1
+        # Bigram context (2-tuple): (tokens[i], tokens[i+1]) → tokens[i+2]
+        for i in range(n - 2):
+            counts[(tokens[i], tokens[i + 1])][tokens[i + 2]] += 1
+        # Trigram context (3-tuple): (tokens[i..i+2]) → tokens[i+3]
+        for i in range(n - 3):
+            counts[(tokens[i], tokens[i + 1], tokens[i + 2])][tokens[i + 3]] += 1
+        # 4-gram context (4-tuple): (tokens[i..i+3]) → tokens[i+4]
+        for i in range(n - 4):
+            counts[(tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3])][tokens[i + 4]] += 1
 
     if skipped:
         print_warning(f"Markov training: skipped {skipped:,} rules that did not tokenize cleanly.")
@@ -982,13 +1024,17 @@ def get_markov_model(
             probs[prefix][nxt] = cnt / t
 
     unique_first_tokens = len(probs.get(START, {}))
-    unique_unigrams = sum(1 for k in probs if isinstance(k, str) and k != START)
-    unique_bigrams  = sum(1 for k in probs if isinstance(k, tuple))
+    unique_unigrams  = sum(1 for k in probs if isinstance(k, str) and k != START)
+    unique_bigrams   = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 2)
+    unique_trigrams  = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 3)
+    unique_fourgrams = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 4)
     print_success(
         f"Token-level Markov model built: "
         f"{unique_first_tokens} start tokens, "
-        f"{unique_unigrams} unigram contexts, "
-        f"{unique_bigrams} bigram contexts."
+        f"{unique_unigrams} unigram, "
+        f"{unique_bigrams} bigram, "
+        f"{unique_trigrams} trigram, "
+        f"{unique_fourgrams} 4-gram contexts."
     )
     return probs, totals
 
@@ -1000,12 +1046,14 @@ def get_markov_weighted_rules(
 ) -> List[Tuple[str, float]]:
     """Score each rule by its log-probability under the token-level Markov model.
 
-    Scoring strategy (mirrors the generation walk):
+    Scoring strategy — highest available context wins at each position:
       1. P(tokens[0] | START)
-      2. For each subsequent token tokens[i] (i ≥ 1):
-           a. Try bigram context (tokens[i-2], tokens[i-1]) → tokens[i]   (if i ≥ 2)
-           b. Fall back to unigram context tokens[i-1] → tokens[i]
-           c. If neither context exists the rule is assigned -∞ and skipped.
+      2. For each subsequent token tokens[i] (i >= 1), try in order:
+           a. 4-gram context  tuple(tokens[i-4:i])  if i >= 4
+           b. Trigram context tuple(tokens[i-3:i])  if i >= 3
+           c. Bigram context  (tokens[i-2], tokens[i-1])  if i >= 2
+           d. Unigram context tokens[i-1]
+           e. None of the above -> rule is skipped (assigned -inf)
 
     Rules that do not tokenize cleanly (round-trip check fails) are silently
     dropped — they cannot have been produced by the model.
@@ -1030,18 +1078,36 @@ def get_markov_weighted_rules(
             continue
         logp += math.log(markov_probabilities[START][tokens[0]])
 
-        # ── Score subsequent tokens ───────────────────────────────────────
+        # ── Score subsequent tokens (4-gram -> trigram -> bigram -> unigram)
         for i in range(1, len(tokens)):
             scored = False
-            # Try bigram context first (available from position i=2 onward)
-            if i >= 2:
-                bigram_key = (tokens[i - 2], tokens[i - 1])
-                if (bigram_key in markov_probabilities
-                        and tokens[i] in markov_probabilities[bigram_key]):
-                    logp += math.log(markov_probabilities[bigram_key][tokens[i]])
+
+            # 4-gram context: (tok[i-4], tok[i-3], tok[i-2], tok[i-1]) -> tok[i]
+            if not scored and i >= 4:
+                key = (tokens[i - 4], tokens[i - 3], tokens[i - 2], tokens[i - 1])
+                if (key in markov_probabilities
+                        and tokens[i] in markov_probabilities[key]):
+                    logp += math.log(markov_probabilities[key][tokens[i]])
                     scored = True
+
+            # Trigram context: (tok[i-3], tok[i-2], tok[i-1]) -> tok[i]
+            if not scored and i >= 3:
+                key = (tokens[i - 3], tokens[i - 2], tokens[i - 1])
+                if (key in markov_probabilities
+                        and tokens[i] in markov_probabilities[key]):
+                    logp += math.log(markov_probabilities[key][tokens[i]])
+                    scored = True
+
+            # Bigram context: (tok[i-2], tok[i-1]) -> tok[i]
+            if not scored and i >= 2:
+                key = (tokens[i - 2], tokens[i - 1])
+                if (key in markov_probabilities
+                        and tokens[i] in markov_probabilities[key]):
+                    logp += math.log(markov_probabilities[key][tokens[i]])
+                    scored = True
+
+            # Unigram fallback: tok[i-1] -> tok[i]
             if not scored:
-                # Fall back to unigram context
                 prev = tokens[i - 1]
                 if prev in markov_probabilities and tokens[i] in markov_probabilities[prev]:
                     logp += math.log(markov_probabilities[prev][tokens[i]])
@@ -1083,24 +1149,27 @@ def generate_rules_from_markov_model(
       min_len=1, max_len=3 means rules with 1, 2, or 3 chained operators.
       This is the natural measure of rule complexity for hashcat.
 
-    SAMPLING STRATEGY:
+    SAMPLING STRATEGY (v3.5 — up to 4-gram context):
       1. Sample first token from P(token | START).
-      2. At each subsequent step, try the bigram context
-         (tokens[-2], tokens[-1]) first; fall back to unigram tokens[-1].
+      2. At each subsequent step, try contexts in descending order of length:
+           4-gram (tokens[-4:]) -> trigram (tokens[-3:]) ->
+           bigram (tokens[-2:]) -> unigram (tokens[-1])
+         The first context that has an entry in the model is used.
       3. Accept the current sequence as a rule whenever
-         min_len ≤ len(token_seq) ≤ max_len.
+         min_len <= len(token_seq) <= max_len.
       4. Continue extending until max_len is reached or no transition exists.
 
     SAFETY NETS:
-      • Tokens whose leading operator is in excluded_operators are never
+      * Tokens whose leading operator is in excluded_operators are never
         sampled (NEVER_PRODUCE_OPS by default).
-      • After joining, _has_banned_op() is checked as a paranoia guard.
-      • TOKEN_REGEX round-trip validation confirms the joined string re-
+      * After joining, _has_banned_op() is checked as a paranoia guard.
+      * TOKEN_REGEX round-trip validation confirms the joined string re-
         tokenises back to the exact same token list.
-      • is_valid_hashcat_rule() / HashcatRuleCleaner.validate_rule() provide
+      * is_valid_hashcat_rule() / HashcatRuleCleaner.validate_rule() provide
         a final syntactic gate.
 
     v3.1: excluded_operators defaults to NEVER_PRODUCE_OPS.
+    v3.5: context cascade extended to 4-gram.
     """
     if not memory_intensive_operation_warning("Markov rule generation"):
         return []
@@ -1116,7 +1185,13 @@ def generate_rules_from_markov_model(
     START = '^'
 
     def _sample_next(context) -> Optional[str]:
-        """Sample the next token given a context key (str or 2-tuple of str).
+        """Sample the next token given a context key.
+
+        context may be:
+          str          — START sentinel or unigram (single token)
+          2-tuple      — bigram context
+          3-tuple      — trigram context
+          4-tuple      — 4-gram context
 
         Only tokens whose leading operator character is NOT in
         excluded_operators are eligible.  The returned value is a full token
@@ -1162,11 +1237,16 @@ def generate_rules_from_markov_model(
         # ── Step 3: Extend to exactly walk_target tokens ─────────────────────
         dead_end = False
         while len(token_seq) < walk_target:
-            # Prefer bigram context; fall back to unigram
-            if len(token_seq) >= 2:
-                bigram_key = (token_seq[-2], token_seq[-1])
-                nxt = _sample_next(bigram_key) or _sample_next(token_seq[-1])
-            else:
+            # Cascade: 4-gram -> trigram -> bigram -> unigram
+            nxt = None
+            seq_len = len(token_seq)
+            if seq_len >= 4:
+                nxt = _sample_next(tuple(token_seq[-4:]))
+            if not nxt and seq_len >= 3:
+                nxt = _sample_next(tuple(token_seq[-3:]))
+            if not nxt and seq_len >= 2:
+                nxt = _sample_next((token_seq[-2], token_seq[-1]))
+            if not nxt:
                 nxt = _sample_next(token_seq[-1])
 
             if not nxt:
@@ -2319,7 +2399,7 @@ def save_rules(
 
     try:
         with open(filename, 'w', encoding='utf-8') as fh:
-            fh.write(f"# CONCENTRATOR v3.4 – {mode_name.upper()} MODE OUTPUT\n")
+            fh.write(f"# CONCENTRATOR v3.5 – {mode_name.upper()} MODE OUTPUT\n")
             fh.write(f"# Generated:   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             fh.write(f"# Total rules: {len(clean_data):,}\n")
             fh.write(f"# Format:      {STATE.output_format}\n#\n")
@@ -2456,7 +2536,7 @@ def enhanced_interactive_processing_loop(
             choice = input(f"{Colors.YELLOW}Enter choice: {Colors.RESET}").strip().lower()
 
             if choice == 'q':
-                print_header("THANK YOU FOR USING CONCENTRATOR v3.4!")
+                print_header("THANK YOU FOR USING CONCENTRATOR v3.5!")
                 break
 
             elif choice == 'p':
@@ -2730,7 +2810,7 @@ def concentrator_main_processing(args: Any) -> None:
 # ==============================================================================
 
 def interactive_mode() -> Optional[Dict]:
-    print_header("CONCENTRATOR v3.4 – INTERACTIVE MODE")
+    print_header("CONCENTRATOR v3.5 – INTERACTIVE MODE")
     settings: Dict[str, Any] = {}
 
     print(f"\n{Colors.CYAN}Input Configuration:{Colors.END}")
@@ -2958,7 +3038,7 @@ def print_usage() -> None:
         for flag, desc in opts:
             print(f"  {C.YELLOW}{flag:<30}{C.END}{desc}")
 
-    print(f"\n{C.BOLD}{C.CYAN}NOTES (v3.4):{C.END}")
+    print(f"\n{C.BOLD}{C.CYAN}NOTES (v3.5):{C.END}")
     print(f"  {C.WHITE}Memory operators (M 4 6 X) and reject operators (< > ! / ( ) = % Q){C.END}")
     print(f"  {C.WHITE}are filtered at every pipeline stage and will never appear in output.{C.END}")
     print(f"  {C.WHITE}Combinatorial generation uses full token units ($5, sae, T3) with{C.END}")
