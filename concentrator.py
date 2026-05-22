@@ -675,7 +675,9 @@ def is_valid_hashcat_rule(rule: str) -> bool:
     n = len(rule)
 
     def is_digit(c: str) -> bool:
-        return '0' <= c <= '9'
+        # hashcat uses base-36 positions: 0-9 and A-Z (for positions 10-35)
+        # matches conv_ctoi() in cleanup-rules.c
+        return ('0' <= c <= '9') or ('A' <= c <= 'Z')
 
     while pos < n:
         c = rule[pos]
@@ -2524,8 +2526,7 @@ def enhanced_interactive_processing_loop(
             print(f" {Colors.GREEN}(2){Colors.RESET} Filter by MAXIMUM NUMBER OF RULES (top N)")
             print(f" {Colors.GREEN}(3){Colors.RESET} Filter by FUNCTIONAL REDUNDANCY [RAM intensive]")
             print(f" {Colors.GREEN}(4){Colors.RESET} INVERSE MODE – keep rules BELOW the cut-off rank")
-            print(f" {Colors.GREEN}(5){Colors.RESET} HASHCAT CLEANUP – validate (CPU/GPU modes)")
-            print(f" {Colors.GREEN}(6){Colors.RESET} TOGGLE OUTPUT FORMAT (currently: {STATE.output_format})")
+            print(f" {Colors.GREEN}(5){Colors.RESET} TOGGLE OUTPUT FORMAT (currently: {STATE.output_format})")
             print(f"\n{Colors.BOLD}ANALYSIS & UTILITIES:{Colors.RESET}")
             print(f" {Colors.BLUE}(p){Colors.RESET} PARETO analysis")
             print(f" {Colors.BLUE}(s){Colors.RESET} SAVE current rules")
@@ -2586,13 +2587,6 @@ def enhanced_interactive_processing_loop(
             elif choice == '4':
                 current_data = inverse_mode_filter(current_data)
             elif choice == '5':
-                print(f"\n{Colors.MAGENTA}[HASHCAT CLEANUP]{Colors.RESET} Choose mode:")
-                print(f" {Colors.CYAN}(1){Colors.RESET} CPU (transformation rules only — memory/reject ops always excluded)")
-                print(f" {Colors.CYAN}(2){Colors.RESET} GPU (same as CPU, no extra restrictions)")
-                m    = input(f"{Colors.YELLOW}Mode (1 or 2): {Colors.RESET}").strip()
-                mode = 1 if m == '1' else 2
-                current_data = hashcat_rule_cleanup(current_data, mode)
-            elif choice == '6':
                 STATE.output_format = 'expanded' if STATE.output_format == 'line' else 'line'
                 print_success(f"Output format → {STATE.output_format}")
                 continue
@@ -2600,7 +2594,7 @@ def enhanced_interactive_processing_loop(
                 print_error("Invalid choice.")
                 continue
 
-            if choice in ('1', '2', '3', '4', '5'):
+            if choice in ('1', '2', '3', '4'):
                 reduction = (
                     (orig_count - len(current_data)) / orig_count * 100
                     if orig_count else 0.0
