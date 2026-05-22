@@ -843,7 +843,8 @@ def gpu_validate_rules(rules_list: List[str], max_rule_length: int = 64) -> List
 def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
     """
     Read one rule file and return:
-      (operator_counts, rule_counts, clean_rules_list, temp_filepath_or_None)
+      (operator_counts, rule_counts, clean_rules_list, temp_filepath_or_None,
+       comment_lines)
 
     v3.1: rules containing any operator from NEVER_PRODUCE_OPS are silently
     dropped at this stage so they never enter the processing pipeline.
@@ -851,17 +852,28 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
     v3.2: operator counting now uses TOKEN_REGEX.findall so that full tokens
     (e.g. '$5', 'sae', 'T3') are counted as atomic units instead of counting
     the operator character and its argument bytes separately.
+
+    v3.5: comment lines (lines starting with '#') are counted separately and
+    returned as the fifth element of the tuple.  They are never included in
+    rule totals or occurrence statistics.
     """
     operator_counts:  Dict[str, int] = defaultdict(int)
     full_rule_counts: Dict[str, int] = defaultdict(int)
     clean_rules:      List[str]      = []
     tmp_path:         Optional[str]  = None
+    comment_lines:    int            = 0
 
     try:
         with open(filepath, 'r', errors='ignore') as fh:
             for line in fh:
                 line = line.strip()
-                if not line or line.startswith('#') or len(line) > max_rule_length:
+                if not line:
+                    continue
+                # v3.5: count comment lines explicitly; never let them enter rule counts
+                if line.startswith('#'):
+                    comment_lines += 1
+                    continue
+                if len(line) > max_rule_length:
                     continue
                 clean = ''.join(c for c in line if c in ALL_RULE_CHARS)
                 if not clean or _has_banned_op(clean):
@@ -881,11 +893,17 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
                 tf.writelines(r + '\n' for r in clean_rules)
             with _cleanup_lock:
                 _temp_files_to_cleanup.append(tmp_path)
-            print_success(f"Processed: {filepath} → {tmp_path}")
-            return operator_counts, full_rule_counts, [], tmp_path
+            print_success(
+                f"Processed: {filepath} → {tmp_path}"
+                + (f" ({comment_lines:,} comment lines skipped)" if comment_lines else "")
+            )
+            return operator_counts, full_rule_counts, [], tmp_path, comment_lines
         else:
-            print_success(f"Processed (in-memory): {filepath}")
-            return operator_counts, full_rule_counts, clean_rules, None
+            print_success(
+                f"Processed (in-memory): {filepath}"
+                + (f" ({comment_lines:,} comment lines skipped)" if comment_lines else "")
+            )
+            return operator_counts, full_rule_counts, clean_rules, None, comment_lines
 
     except Exception as exc:
         print_error(f"Error processing {filepath}: {exc}")
@@ -897,7 +915,7 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
                         _temp_files_to_cleanup.remove(tmp_path)
             except OSError:
                 pass
-        return defaultdict(int), defaultdict(int), [], None
+        return defaultdict(int), defaultdict(int), [], None, 0
 
 
 def analyze_rule_files_parallel(
@@ -908,8 +926,9 @@ def analyze_rule_files_parallel(
         print_warning("No valid rule files to process.")
         return [], defaultdict(int), []
 
-    total_op_counts:   Dict[str, int] = defaultdict(int)
-    total_rule_counts: Dict[str, int] = defaultdict(int)
+    total_op_counts:    Dict[str, int] = defaultdict(int)
+    total_rule_counts:  Dict[str, int] = defaultdict(int)
+    total_comment_lines: int           = 0
     temp_files: List[str] = []
     all_rules:  List[str] = []
 
@@ -918,11 +937,13 @@ def analyze_rule_files_parallel(
     print_info(f"Parallel analysis of {len(valid_fps)} files using {n_procs} processes...")
 
     with multiprocessing.Pool(processes=n_procs) as pool:
-        for op_c, rule_c, rules, tmp in pool.starmap(process_single_file, tasks):
+        # v3.5: process_single_file now returns a 5-tuple (adds comment_lines)
+        for op_c, rule_c, rules, tmp, comment_lines in pool.starmap(process_single_file, tasks):
             for op, cnt in op_c.items():
                 total_op_counts[op] += cnt
             for rule, cnt in rule_c.items():
                 total_rule_counts[rule] += cnt
+            total_comment_lines += comment_lines
             if STATE.in_memory_mode:
                 all_rules.extend(rules)
             elif tmp:
@@ -942,6 +963,11 @@ def analyze_rule_files_parallel(
                 print_error(f"Error merging {tmp}: {exc}")
 
     print_success(f"Total unique rules loaded: {len(total_rule_counts):,}")
+    if total_comment_lines:
+        print_info(
+            f"Comment lines skipped (not counted in totals): "
+            f"{colorize(f'{total_comment_lines:,}', Colors.YELLOW)}"
+        )
     sorted_op_counts = sorted(total_op_counts.items(), key=lambda kv: kv[1], reverse=True)
     return sorted_op_counts, total_rule_counts, all_rules
 
@@ -2379,6 +2405,11 @@ def save_rules(
 
     v3.1: final safety-net pass that strips any rule still containing a
     NEVER_PRODUCE_OP before writing to disk.
+
+    v3.5: a ':' (no-op / passthrough) rule is automatically inserted as the
+    first active rule, immediately after the file header comments.  This
+    follows the hashcat convention of including an unmodified-candidate pass
+    as the very first rule in every rule set.
     """
     if not data:
         print_error("No rules to save!")
@@ -2401,15 +2432,19 @@ def save_rules(
 
     try:
         with open(filename, 'w', encoding='utf-8') as fh:
+            # Header comments
             fh.write(f"# CONCENTRATOR v3.5 – {mode_name.upper()} MODE OUTPUT\n")
             fh.write(f"# Generated:   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            fh.write(f"# Total rules: {len(clean_data):,}\n")
-            fh.write(f"# Format:      {STATE.output_format}\n#\n")
+            fh.write(f"# Total rules: {len(clean_data):,} (+ 1 no-op passthrough prepended)\n")
+            fh.write(f"# Format:      {STATE.output_format}\n")
+            fh.write(f"#\n")
+            # v3.5: ':' passthrough rule as the first active entry
+            fh.write(":\n")
             for item in clean_data:
                 rule = _extract_rule(item)
                 line = expand_rule(rule) if STATE.output_format == 'expanded' else rule
                 fh.write(line + '\n')
-        print_success(f"Saved {len(clean_data):,} rules → {filename}")
+        print_success(f"Saved {len(clean_data):,} rules (+1 ':' passthrough) → {filename}")
         return True
     except IOError as exc:
         print_error(f"Failed to save: {exc}")
@@ -2459,17 +2494,63 @@ class HashcatRuleCleaner:
     def clean_rules(
         self, rules_data: List[Tuple[str, int]]
     ) -> List[Tuple[str, int]]:
+        """
+        Validate every rule in *rules_data* and return only the passing ones.
+
+        v3.5: reports three separate rejection reasons so the operator knows
+        exactly what was removed:
+          • banned operators  (NEVER_PRODUCE_OPS: memory / reject ops)
+          • syntax errors     (is_valid_hashcat_rule returned False)
+          • total retained
+        """
         mode_label = 'GPU' if self.mode == 2 else 'CPU'
         print_section(f"Hashcat Rule Validation ({mode_label} mode)")
-        print(f"Validating {colorize(f'{len(rules_data):,}', Colors.CYAN)} rules...")
-        valid:   List[Tuple[str, int]] = []
-        invalid: int                   = 0
+        print(
+            f"Input: {colorize(f'{len(rules_data):,}', Colors.CYAN)} rules  "
+            f"│  Mode: {colorize(mode_label, Colors.MAGENTA)}  "
+            f"│  Banned-op filter + syntax check"
+        )
+        valid:        List[Tuple[str, int]] = []
+        n_banned:     int = 0
+        n_syntax_err: int = 0
+
         for rule, cnt in tqdm(rules_data, desc="Validating rules"):
-            if self.validate_rule(rule):
+            stripped = rule.strip()
+            if not stripped:
+                n_syntax_err += 1
+                continue
+            if _has_banned_op(stripped):
+                n_banned += 1
+                continue
+            if is_valid_hashcat_rule(stripped):
                 valid.append((rule, cnt))
             else:
-                invalid += 1
-        print_success(f"Removed {invalid:,} invalid rules. {len(valid):,} valid remaining.")
+                n_syntax_err += 1
+
+        total_removed = n_banned + n_syntax_err
+        print(f"\n{Colors.BOLD}Cleanup summary:{Colors.RESET}")
+        print(
+            f"  {Colors.RED}Banned operators removed : "
+            f"{colorize(f'{n_banned:,}', Colors.RED)}{Colors.RESET}"
+        )
+        print(
+            f"  {Colors.YELLOW}Syntax errors removed    : "
+            f"{colorize(f'{n_syntax_err:,}', Colors.YELLOW)}{Colors.RESET}"
+        )
+        print(
+            f"  {Colors.GREEN}Total removed            : "
+            f"{colorize(f'{total_removed:,}', Colors.RED)}{Colors.RESET}"
+        )
+        print(
+            f"  {Colors.GREEN}Rules retained           : "
+            f"{colorize(f'{len(valid):,}', Colors.GREEN)}{Colors.RESET}"
+        )
+        if rules_data:
+            pct_kept = len(valid) / len(rules_data) * 100
+            print(
+                f"  {Colors.CYAN}Retention rate           : "
+                f"{colorize(f'{pct_kept:.1f}%', Colors.CYAN)}{Colors.RESET}"
+            )
         return valid
 
 
@@ -2526,7 +2607,8 @@ def enhanced_interactive_processing_loop(
             print(f" {Colors.GREEN}(2){Colors.RESET} Filter by MAXIMUM NUMBER OF RULES (top N)")
             print(f" {Colors.GREEN}(3){Colors.RESET} Filter by FUNCTIONAL REDUNDANCY [RAM intensive]")
             print(f" {Colors.GREEN}(4){Colors.RESET} INVERSE MODE – keep rules BELOW the cut-off rank")
-            print(f" {Colors.GREEN}(5){Colors.RESET} TOGGLE OUTPUT FORMAT (currently: {STATE.output_format})")
+            print(f" {Colors.GREEN}(5){Colors.RESET} HASHCAT CLEANUP – validate rules (CPU/GPU modes)")
+            print(f" {Colors.GREEN}(6){Colors.RESET} TOGGLE OUTPUT FORMAT (currently: {STATE.output_format})")
             print(f"\n{Colors.BOLD}ANALYSIS & UTILITIES:{Colors.RESET}")
             print(f" {Colors.BLUE}(p){Colors.RESET} PARETO analysis")
             print(f" {Colors.BLUE}(s){Colors.RESET} SAVE current rules")
@@ -2587,6 +2669,20 @@ def enhanced_interactive_processing_loop(
             elif choice == '4':
                 current_data = inverse_mode_filter(current_data)
             elif choice == '5':
+                print(f"\n{Colors.MAGENTA}[HASHCAT CLEANUP]{Colors.RESET} Choose validation mode:")
+                print(f" {Colors.CYAN}(1){Colors.RESET} CPU — transformation rules only")
+                print(f"     Memory ops (M 4 6 X) and reject ops (< > ! / ( ) = % Q) are")
+                print(f"     always excluded regardless of mode selection.")
+                print(f" {Colors.CYAN}(2){Colors.RESET} GPU — same validator, MAX_RULES=255 enforced")
+                print(f" {Colors.CYAN}(3){Colors.RESET} Cancel")
+                m = input(f"{Colors.YELLOW}Mode (1/2/3): {Colors.RESET}").strip()
+                if m in ('1', '2'):
+                    mode = int(m)
+                    current_data = hashcat_rule_cleanup(current_data, mode)
+                else:
+                    print_info("Hashcat cleanup cancelled.")
+                    continue
+            elif choice == '6':
                 STATE.output_format = 'expanded' if STATE.output_format == 'line' else 'line'
                 print_success(f"Output format → {STATE.output_format}")
                 continue
@@ -2594,7 +2690,7 @@ def enhanced_interactive_processing_loop(
                 print_error("Invalid choice.")
                 continue
 
-            if choice in ('1', '2', '3', '4'):
+            if choice in ('1', '2', '3', '4', '5'):
                 reduction = (
                     (orig_count - len(current_data)) / orig_count * 100
                     if orig_count else 0.0
