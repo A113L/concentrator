@@ -324,11 +324,24 @@ OPERATOR_ARGS: Dict[str, List[str]] = {
 
 ALL_OPERATORS = list(OPERATOR_ARGS.keys())
 
-ALL_RULE_CHARS = set(
-    '0123456789abcdefghijklmnopqrstuvwxyz'
-    'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    ':,.lu.#()=%!?|~+*-^$sStTiIoOcCrRyYzZeEfFxXdDpPbBqQ`[]><@&vV'
-)
+# ALL_RULE_CHARS: every character that may legally appear in a hashcat rule.
+# This includes all printable ASCII except space (space is only a token
+# *separator* in expanded-format files; it is never stripped as an argument
+# because process_single_file normalises via TOKEN_REGEX which preserves
+# embedded-space arguments).
+#
+# v3.5 fix: the previous hard-coded set was missing the following valid
+# operator/argument characters, causing them to be silently stripped from
+# every rule during loading and corrupting any rule that used them:
+#   {  }   — rotate-left / rotate-right (zero-arg operators)
+#   _      — reject-unless-length  (one-num-arg operator, e.g.  _8)
+#   '      — truncate-at           (one-num-arg operator, e.g.  '6)
+#   \      — valid literal character argument for s, i, o, $, ^ …
+#   "      — ditto
+#   ;      — ditto
+# Using PRINTABLE_ASCII minus space is both correct and forward-compatible:
+# any future hashcat operator that uses a printable char will be handled.
+ALL_RULE_CHARS: Set[str] = PRINTABLE_ASCII - {' '}
 
 # ---------------------------------------------------------------------------
 # NEVER_PRODUCE_OPS  (v3.1)
@@ -644,39 +657,58 @@ def set_global_flags(temp_dir_path: Optional[str], in_memory_mode: bool) -> None
 # ==============================================================================
 
 def should_exclude_rule(rule: str) -> bool:
-    """Return True if the rule uses an operator that is permanently excluded."""
+    """Return True if *rule* is a trivially-excluded single operator.
+
+    This is a fast pre-check called before the full token-by-token loop in
+    is_valid_hashcat_rule().  It only catches degenerate 1- or 2-character
+    rules whose single operator is in NEVER_PRODUCE_OPS or is completely
+    unknown to hashcat's parser.  All multi-operator rules are handled by
+    the main loop.
+
+    v3.5 fix: removed the previous catch-all for 3-char rules starting with
+    '?', '=', or 'v'.  '=' and '%' are already in NEVER_PRODUCE_OPS and are
+    caught by _has_banned_op(); '?' and 'v' are not recognised operators and
+    are correctly rejected by the "any other character" fall-through in the
+    main loop.  The over-broad 3-char check was incorrectly blocking any rule
+    whose THIRD character happened to be '?', '=', or 'v', because the check
+    looked at rule[0], not at the actual operator position.
+    """
     if not rule:
         return False
-    # Single-character reject/memory ops
+    # A bare single-character excluded operator (M, 4, 6, Q already in
+    # NEVER_PRODUCE_OPS; _ is a reject op that concentrator never generates)
     if len(rule) == 1 and rule in ('_', 'M', '4', '6', 'Q'):
-        return True
-    # Two-character reject ops (some have a digit, but we check only first char)
-    if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'):
-        return True
-    # Three-character reject ops (e.g. '=0', '%0', 'Q0')
-    if len(rule) == 3 and rule[0] in ('?', '=', 'v'):
         return True
     return False
 
 
 def is_valid_hashcat_rule(rule: str) -> bool:
-    """Return True if *rule* is syntactically valid according to rulest's validator.
+    """Return True if *rule* is syntactically valid for hashcat (CPU mode).
 
-    This is a direct translation of HashcatRuleValidator.validate_rule_for_gpu
-    from rulest_v2.py, ensuring that concentrator's cleanup mode never discards
-    rules that rulest would accept.
+    Covers all operators listed in OPERATOR_ARGS.  Spaces inside the rule are
+    treated as token separators and skipped (matching hashcat's own parser and
+    rulest's validate_rule_for_gpu).
+
+    v3.5 fix: added missing operators that caused mode-5 to incorrectly remove
+    valid rules:
+      _N  — reject unless password length == N  (one base-36 digit arg)
+      {   — rotate left                         (zero args)
+      }   — rotate right                        (zero args)
+      '   — truncate at position N              (one base-36 digit arg)
+    The _ operator is NOT in NEVER_PRODUCE_OPS, so it must be accepted here.
     """
     # Quick rejection for permanently excluded operators
     if should_exclude_rule(rule):
         return False
-
+    # An empty rule (or all-whitespace) is not a valid rule
+    if not rule.strip():
+        return False
     pos = 0
     cnt = 0
     n = len(rule)
 
     def is_digit(c: str) -> bool:
         # hashcat uses base-36 positions: 0-9 and A-Z (for positions 10-35)
-        # matches conv_ctoi() in cleanup-rules.c
         return ('0' <= c <= '9') or ('A' <= c <= 'Z')
 
     while pos < n:
@@ -698,7 +730,8 @@ def is_valid_hashcat_rule(rule: str) -> bool:
             cnt += 1
             continue
         # Operators with exactly one digit argument
-        if c in ('T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'y', 'Y'):
+        # v3.5: added '_' (reject-unless-length) and "'" (truncate-at)
+        if c in ('T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'y', 'Y', '_'):
             pos += 1
             if pos >= n or not is_digit(rule[pos]):
                 return False
@@ -747,7 +780,9 @@ def is_valid_hashcat_rule(rule: str) -> bool:
         return False
 
     # GPU rules limit (rulest uses MAX_GPU_RULES = 255)
-    return cnt <= 255
+    # Also require at least one valid operator (empty/all-space string already
+    # caught above, but guard here too)
+    return 1 <= cnt <= 255
 
 
 # ==============================================================================
@@ -873,15 +908,46 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
                 if line.startswith('#'):
                     comment_lines += 1
                     continue
-                if len(line) > max_rule_length:
+
+                # ------------------------------------------------------------------
+                # Normalise to compact form.
+                #
+                # v3.5 fix: the previous approach filtered characters with
+                # ALL_RULE_CHARS and then checked len(line).  This had two bugs:
+                #
+                # 1.  ALL_RULE_CHARS was missing valid operator characters ({, },
+                #     _, ', \, …), so those characters were silently stripped,
+                #     corrupting any rule that used them.
+                #
+                # 2.  The length check ran on the *raw* line, so expanded-format
+                #     input (tokens separated by spaces, e.g. "sA- sS~ $1 $2")
+                #     was incorrectly rejected when the expanded form was longer
+                #     than max_rule_length even though the compact form was fine.
+                #
+                # Fix: use TOKEN_REGEX.findall() which:
+                #   • naturally ignores whitespace between tokens (spaces that are
+                #     token separators are simply not matched and are skipped)
+                #   • preserves whitespace that IS a literal character argument
+                #     (e.g. "sP " = replace P with space — the trailing space IS
+                #     part of the token and is included in the match)
+                #   • drops characters that are not part of any valid token
+                #     (truly malformed bytes), producing a clean compact form
+                #
+                # After findall we join tokens and apply the length limit on the
+                # resulting compact string, not on the original raw line.
+                # ------------------------------------------------------------------
+                tokens = TOKEN_REGEX.findall(line)
+                if not tokens:
                     continue
-                clean = ''.join(c for c in line if c in ALL_RULE_CHARS)
-                if not clean or _has_banned_op(clean):
+                clean = ''.join(tokens)
+                if not clean or len(clean) > max_rule_length:
                     continue
+                if _has_banned_op(clean):
+                    continue
+                # ------------------------------------------------------------------
                 full_rule_counts[clean] += 1
                 clean_rules.append(clean)
-                # v3.2: count full tokens (e.g. '$5', 'sae') not bare op chars
-                for token in TOKEN_REGEX.findall(clean):
+                for token in tokens:
                     operator_counts[token] += 1
 
         if not STATE.in_memory_mode:
@@ -2497,11 +2563,11 @@ class HashcatRuleCleaner:
         """
         Validate every rule in *rules_data* and return only the passing ones.
 
-        v3.5: reports three separate rejection reasons so the operator knows
-        exactly what was removed:
-          • banned operators  (NEVER_PRODUCE_OPS: memory / reject ops)
-          • syntax errors     (is_valid_hashcat_rule returned False)
-          • total retained
+        v3.5 fix: is_valid_hashcat_rule now correctly handles all operators,
+        including _ (reject-unless-length), { and } (rotate), and ' (truncate),
+        which were previously missing and caused valid rules to be rejected.
+        Rules that contain banned operators (NEVER_PRODUCE_OPS) are counted
+        separately from genuine syntax errors.
         """
         mode_label = 'GPU' if self.mode == 2 else 'CPU'
         print_section(f"Hashcat Rule Validation ({mode_label} mode)")
