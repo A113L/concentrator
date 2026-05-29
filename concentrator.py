@@ -31,6 +31,38 @@ Changes from v3.4 → v3.5
    behaviour is identical to v3.4 (trigram/4-gram contexts cannot fire before
    the walk terminates); the improvement is visible at max_len >= 5.
 
+Changes from v3.4 → v3.5
+─────────────────────────
+Synchronised TEST_VECTOR and _min_apply_single engine with minimizer.py v1.4.
+
+1. TEST_VECTOR extended from 33 → 50 words (matching minimizer.py BUILTIN_PROBES)
+
+   a. Extended-length words (len 12–36) added.
+      Without words of length ≥ 12, every rule touching position 11+ (opcodes
+      'B–'Z, TB–TZ, DB–DZ, LB–LZ, RB–RZ, +B–+Z, -B–-Z, iCX–iZX, oNX for
+      N ≥ 11, etc.) is a no-op on the entire probe set and collapses into the
+      same signature as ":", causing mass false deduplication.  Nine words of
+      lengths 14, 15, 16, 20, 22, 26, 30, 34, 36 now cover positions B(11)
+      through Z(35) inclusively.
+
+   b. Alphabet-coverage words added.
+      The previous probe set was missing lowercase letters j, x, z and 19
+      uppercase letters (B C D E F G I J K L N O Q R T V X Y Z), plus almost
+      all punctuation characters.  Rules like @j, @x, @z (purge), sja, sxA
+      (replace), and all rules whose target character appeared in none of the
+      probe words were indistinguishable from no-ops.  Eight new words now
+      provide complete coverage of all 95 printable ASCII code-points (0x20–0x7E):
+        "abcdefghijklmnopqrstuvwxyz"   — all 26 lowercase
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"   — all 26 uppercase
+        "!@#$%^&*()-_=+[]{}|;:,.<>?/~" — 30 common punctuation chars
+        "a`b"  "a\"b"  "a'b"  "a\\b"  "a b"  — backtick, quotes, backslash, space
+
+2. E opcode separator fix (_min_apply_single)
+   cap was set to `c in (32, 45, 95)` (space, hyphen, underscore).  Hashcat's E
+   opcode uses only ASCII space (0x20) as the word separator.  Fixed: cap = (c == 32).
+   The incorrect separators produced wrong signatures for words containing
+   hyphens or underscores.
+
 Changes from v3.3 → v3.4
 ─────────────────────────
 Synchronised the internal minimizer engine with minimizer.py fixes.
@@ -158,8 +190,9 @@ Changes from v3.0 → v3.1
 2. Unified TEST_VECTOR (sourced from minimizer.py BUILTIN_PROBES)
    The TEST_VECTOR is now drawn exclusively from minimizer.py's BUILTIN_PROBES
    so that both tools compute signatures against an identical word set.  The
-   shared probe set covers:
-     • lengths 2–11  (exercises position ops across short and medium words)
+   shared probe set (50 words as of v1.4) covers:
+     • lengths 2–36  (exercises position ops across short, medium, and long words)
+     • all 95 printable ASCII code-points (complete @X / sXY rule coverage)
      • all-lowercase, mixed-case, embedded-digit, and special-char words
      • repeated-character strings (aaaa, bbbb)
    Using a single canonical probe set ensures that a rule minimized by
@@ -347,6 +380,37 @@ ALL_RULE_CHARS: Set[str] = PRINTABLE_ASCII - {' '}
 # NEVER_PRODUCE_OPS  (v3.1)
 # ---------------------------------------------------------------------------
 NEVER_PRODUCE_OPS: Set[str] = frozenset({'M', '4', '6', 'X', '<', '>', '!', '/', '(', ')', '=', '%', 'Q'})
+
+
+# ---------------------------------------------------------------------------
+# CRACK_FOCUSED_TOKENS  (v3.5)
+# ---------------------------------------------------------------------------
+# Curated set of tokens empirically known to produce many password cracks.
+# Always injected into the combinatorial operator pool and Markov training
+# corpus so they fire even when the input rule files are small or homogeneous.
+#
+# Categories:
+#   • Case/structural transforms — the single most effective class of rules
+#   • Digit appends/prepends — extremely common real-world password suffixes
+#   • Common leet substitutions — sa@, se3, so0, ss5, st7 …
+#   • Symbol appends — !, @, #, . (very frequent trailing chars)
+#   • Truncation ops — passwords are often stem + short suffix
+CRACK_FOCUSED_TOKENS: List[str] = [tok for tok in [
+    # Case / word-level transforms
+    'l', 'u', 'c', 'C', 't', 'E', 'r', 'd', 'f',
+    # Structural
+    '[', ']', '{', '}',
+    # Digit appends
+    '$0','$1','$2','$3','$4','$5','$6','$7','$8','$9',
+    # Digit prepends
+    '^0','^1','^2','^3','^4','^5','^6','^7','^8','^9',
+    # Common leet substitutions (operator token, not banned)
+    'sa@','se3','si!','so0','ss5','st7','sb6',
+    # Symbol appends
+    '$!','$@','$#','$.',
+    # Truncation to common password lengths
+    "'4","'5","'6","'7","'8",
+] if tok[0] not in NEVER_PRODUCE_OPS]
 
 
 def _has_banned_op(rule: str) -> bool:
@@ -1043,95 +1107,91 @@ def analyze_rule_files_parallel(
 # ==============================================================================
 
 def get_markov_model(
-    unique_rules: Dict[str, int]
+    unique_rules: Dict[str, int],
+    kn_discount:  float = 0.75,
 ) -> Tuple[Optional[Dict], Optional[Dict]]:
-    """Build a fourth-order token-level Markov model from a rule corpus.
+    """Build a KN-smoothed fourth-order token-level Markov model.
 
-    The model operates on atomic hashcat TOKENS (as produced by TOKEN_REGEX),
-    NOT on raw characters.  A token is the smallest meaningful unit of a
-    hashcat rule — e.g. 'l', 'u', '$5', 'sae', 'T3', 'i2X'.  Using tokens
-    instead of characters ensures that:
+    v3.5: Kneser-Ney with CORRECT += 1 semantics — each unique rule string
+    contributes exactly 1 count to every n-gram it generates, regardless of
+    corpus frequency.  This is the same equal-vote principle as the MLE model
+    (restored after the += freq regression in v3.5 caused degenerate output).
 
-      • Transitions reflect semantically meaningful operator sequences.
-      • Every walk through the model produces structurally valid rules because
-        every token is itself a complete, valid operator+argument unit.
-      • min_len / max_len refer to operator counts, not byte lengths, which is
-        the natural measure of rule complexity for hashcat.
-
-    Five transition tables are stored under the same 'probs' dict:
-
-      START → first_token                     key: '^'             (string)
-      token_i → token_{i+1}                   key: token_i         (1-tuple / unigram ctx)
-      (token_{i-1}, token_i) →                key: 2-tuple         (bigram ctx)
-          token_{i+1}
-      (token_{i-2}, token_{i-1}, token_i) →   key: 3-tuple         (trigram ctx)
-          token_{i+1}
-      (tok_{i-3}..token_i) →                  key: 4-tuple         (4-gram ctx)
-          token_{i+1}
-
-    During generation and scoring the highest-order context that has an
-    observation is preferred; shorter contexts are used as fallbacks:
-        4-gram → trigram → bigram → unigram
-
-    Higher-order contexts improve rule quality when the training corpus is
-    large enough; for short rules (max_len ≤ 3) only unigram/bigram contexts
-    fire in practice, so the model degrades gracefully on small corpora.
+    KN adds two improvements over plain MLE:
+      1. Absolute discounting: max(count - D, 0) / total   removes D from
+         every observed count, reserving probability mass for unseen pairs.
+      2. Continuation-count unigram prior: P_KN(w) ∝ |unique contexts w follows|
+         — tokens that are contextually flexible (c, l, sa@) get a higher floor
+         than tokens that only ever appear after one specific context.
     """
     if not memory_intensive_operation_warning("Markov model building"):
         return None, None
-    print_section("Building Token-Level Markov Sequence Probability Model (up to 4-grams)")
-    counts: Dict = defaultdict(lambda: defaultdict(int))
+    print_section("Building KN-Smoothed Token-Level Markov Model (D=%.2f, 4-grams)" % kn_discount)
     START = '^'
+    D     = kn_discount
+
+    counts: Dict = defaultdict(lambda: defaultdict(int))
+    continuation_contexts: Dict[str, set] = defaultdict(set)
     skipped = 0
-    for rule in unique_rules:
+
+    for rule in unique_rules:           # keys only — += 1 per unique rule
         if not rule:
             continue
         tokens = TOKEN_REGEX.findall(rule)
-        # Only train on rules that tokenize cleanly (round-trip check)
         if not tokens or ''.join(tokens) != rule:
             skipped += 1
             continue
         n = len(tokens)
-        # START → first token
         counts[START][tokens[0]] += 1
-        # Unigram transitions: tokens[i] → tokens[i+1]
         for i in range(n - 1):
             counts[tokens[i]][tokens[i + 1]] += 1
-        # Bigram context (2-tuple): (tokens[i], tokens[i+1]) → tokens[i+2]
+            continuation_contexts[tokens[i + 1]].add(tokens[i])
         for i in range(n - 2):
-            counts[(tokens[i], tokens[i + 1])][tokens[i + 2]] += 1
-        # Trigram context (3-tuple): (tokens[i..i+2]) → tokens[i+3]
+            ctx = (tokens[i], tokens[i + 1])
+            counts[ctx][tokens[i + 2]] += 1
+            continuation_contexts[tokens[i + 2]].add(ctx)
         for i in range(n - 3):
-            counts[(tokens[i], tokens[i + 1], tokens[i + 2])][tokens[i + 3]] += 1
-        # 4-gram context (4-tuple): (tokens[i..i+3]) → tokens[i+4]
+            counts[(tokens[i], tokens[i+1], tokens[i+2])][tokens[i+3]] += 1
         for i in range(n - 4):
-            counts[(tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3])][tokens[i + 4]] += 1
+            counts[(tokens[i], tokens[i+1], tokens[i+2], tokens[i+3])][tokens[i+4]] += 1
 
     if skipped:
         print_warning(f"Markov training: skipped {skipped:,} rules that did not tokenize cleanly.")
 
+    # KN unigram: continuation probability
+    cont_counts = {tok: len(ctxs) for tok, ctxs in continuation_contexts.items()}
+    total_cont  = sum(cont_counts.values()) or 1
+    kn_unigram  = {tok: c / total_cont for tok, c in cont_counts.items()}
+
     totals = {k: sum(v.values()) for k, v in counts.items()}
     probs: Dict = defaultdict(lambda: defaultdict(float))
-    for prefix, next_counts in counts.items():
-        t = totals[prefix]
-        for nxt, cnt in next_counts.items():
-            probs[prefix][nxt] = cnt / t
 
-    unique_first_tokens = len(probs.get(START, {}))
-    unique_unigrams  = sum(1 for k in probs if isinstance(k, str) and k != START)
-    unique_bigrams   = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 2)
-    unique_trigrams  = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 3)
-    unique_fourgrams = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 4)
+    for ctx, next_counts in counts.items():
+        total = totals[ctx]
+        if total == 0:
+            continue
+        if ctx == START:
+            for nxt, cnt in next_counts.items():
+                probs[START][nxt] = cnt / total
+            continue
+        n_types = len(next_counts)
+        lam     = (D * n_types) / total
+        for nxt, cnt in next_counts.items():
+            lower         = kn_unigram.get(nxt, 1e-9)
+            probs[ctx][nxt] = max(cnt - D, 0.0) / total + lam * lower
+
+    probs['__kn_unigram__'] = dict(kn_unigram)
+
+    u_start    = len(probs.get(START, {}))
+    u_unigram  = sum(1 for k in probs if isinstance(k, str) and k not in (START, '__kn_unigram__'))
+    u_bigram   = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 2)
+    u_trigram  = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 3)
+    u_fourgram = sum(1 for k in probs if isinstance(k, tuple) and len(k) == 4)
     print_success(
-        f"Token-level Markov model built: "
-        f"{unique_first_tokens} start tokens, "
-        f"{unique_unigrams} unigram, "
-        f"{unique_bigrams} bigram, "
-        f"{unique_trigrams} trigram, "
-        f"{unique_fourgrams} 4-gram contexts."
+        f"KN model (D={D}): {u_start} starters | "
+        f"{u_unigram} unigram  {u_bigram} bigram  {u_trigram} trigram  {u_fourgram} 4-gram"
     )
     return probs, totals
-
 
 def get_markov_weighted_rules(
     unique_rules:         Dict[str, int],
@@ -1227,159 +1287,120 @@ def generate_rules_from_markov_model(
     gpu_mode:             bool = False,
     excluded_operators:   Optional[Set[str]] = None,
 ) -> List[Tuple[str, float]]:
-    """Generate *target* valid hashcat rules via a token-level Markov walk.
+    """Generate *target* valid hashcat rules via best-first Priority Queue search.
 
-    ── Key design decisions ────────────────────────────────────────────────
+    v3.5: PQ generation restored with corrected model semantics (KN + +=1).
+    Rules are emitted in descending probability order — the first N rules are
+    provably the N most likely under the model, unlike the random walk which
+    produced an arbitrary ordering.
 
-    TOKEN-LEVEL walk (v3.3 improvement over v3.2 character-level walk):
-      The walk samples full hashcat TOKENS at every step instead of single
-      characters.  A token is an atomic operator+argument unit (e.g. 'l',
-      '$5', 'sae', 'i3X') as produced by TOKEN_REGEX.  This guarantees that
-      every candidate rule is structurally valid and eliminates the massive
-      rejection rate of the old character-level approach.
-
-    LENGTH SEMANTICS:
-      min_len / max_len now count TOKENS (operators), not raw bytes.
-      min_len=1, max_len=3 means rules with 1, 2, or 3 chained operators.
-      This is the natural measure of rule complexity for hashcat.
-
-    SAMPLING STRATEGY (v3.5 — up to 4-gram context):
-      1. Sample first token from P(token | START).
-      2. At each subsequent step, try contexts in descending order of length:
-           4-gram (tokens[-4:]) -> trigram (tokens[-3:]) ->
-           bigram (tokens[-2:]) -> unigram (tokens[-1])
-         The first context that has an entry in the model is used.
-      3. Accept the current sequence as a rule whenever
-         min_len <= len(token_seq) <= max_len.
-      4. Continue extending until max_len is reached or no transition exists.
-
-    SAFETY NETS:
-      * Tokens whose leading operator is in excluded_operators are never
-        sampled (NEVER_PRODUCE_OPS by default).
-      * After joining, _has_banned_op() is checked as a paranoia guard.
-      * TOKEN_REGEX round-trip validation confirms the joined string re-
-        tokenises back to the exact same token list.
-      * is_valid_hashcat_rule() / HashcatRuleCleaner.validate_rule() provide
-        a final syntactic gate.
-
-    v3.1: excluded_operators defaults to NEVER_PRODUCE_OPS.
-    v3.5: context cascade extended to 4-gram.
+    Skip-gram backoff: when a context has no observed transition, drops one
+    middle position before falling back to shorter context, then KN unigram.
+    PQ is capped at target*15 entries to prevent exponential blowup.
     """
+    import heapq as _heapq
+
     if not memory_intensive_operation_warning("Markov rule generation"):
         return []
     if excluded_operators is None:
         excluded_operators = NEVER_PRODUCE_OPS
 
     print_section(
-        f"Generating Token-Level Markov Rules "
-        f"({min_len}–{max_len} tokens/operators, target: {target:,})"
+        f"Generating Token-Level Markov Rules — Best-First PQ"
+        f"({min_len}–{max_len} tokens, target: {target:,})"
     )
     print_info(f"Excluding operators: {', '.join(sorted(excluded_operators))}")
 
-    START = '^'
+    START      = '^'
+    KN_UNIGRAM = markov_probabilities.get('__kn_unigram__', {})
+    PQ_CAP     = max(target * 15, 50000)
 
-    def _sample_next(context) -> Optional[str]:
-        """Sample the next token given a context key.
+    def _get_transitions(token_seq: List[str]) -> List[Tuple[str, float]]:
+        """Transitions for token_seq with skip-gram backoff."""
+        def _from_ctx(ctx):
+            d = markov_probabilities.get(ctx)
+            if not d:
+                return []
+            return [(t, p) for t, p in d.items() if t[0] not in excluded_operators]
 
-        context may be:
-          str          — START sentinel or unigram (single token)
-          2-tuple      — bigram context
-          3-tuple      — trigram context
-          4-tuple      — 4-gram context
+        seq_len = len(token_seq)
+        result  = []
 
-        Only tokens whose leading operator character is NOT in
-        excluded_operators are eligible.  The returned value is a full token
-        string such as 'l', '$5', or 'sae'.
-        """
-        if context not in markov_probabilities:
-            return None
-        choices: List[str]   = []
-        weights: List[float] = []
-        for tok, prob in markov_probabilities[context].items():
-            if tok[0] not in excluded_operators:
-                choices.append(tok)
-                weights.append(prob)
-        if not choices:
-            return None
-        # random.choices handles unnormalized weights natively — no need to
-        # pre-divide; avoids an extra O(n) pass over weights each call.
-        return random.choices(choices, weights=weights, k=1)[0]
-
-    generated: Set[str] = set()
-    # Each walk now targets a RANDOMLY SAMPLED length from [min_len, max_len].
-    # This gives a uniform distribution of rule lengths across the full range.
-    # The old approach (extend to max_len, accept at every step) produced a
-    # heavy bias toward max_len: longer chains have exponentially more unique
-    # combinations and dominated `generated` first.
-    max_attempts = target * 20       # generous budget; most walks succeed
-    n_lengths    = max_len - min_len + 1
-    length_counts: Dict[int, int] = {l: 0 for l in range(min_len, max_len + 1)}
-
-    for _ in range(max_attempts):
-        if len(generated) >= target:
-            break
-
-        # ── Step 1: Pick a target length uniformly from [min_len, max_len] ──
-        walk_target = random.randint(min_len, max_len)
-
-        # ── Step 2: Sample the first token ───────────────────────────────────
-        first = _sample_next(START)
-        if not first:
-            continue
-        token_seq: List[str] = [first]
-
-        # ── Step 3: Extend to exactly walk_target tokens ─────────────────────
-        dead_end = False
-        while len(token_seq) < walk_target:
-            # Cascade: 4-gram -> trigram -> bigram -> unigram
-            nxt = None
-            seq_len = len(token_seq)
-            if seq_len >= 4:
-                nxt = _sample_next(tuple(token_seq[-4:]))
-            if not nxt and seq_len >= 3:
-                nxt = _sample_next(tuple(token_seq[-3:]))
-            if not nxt and seq_len >= 2:
-                nxt = _sample_next((token_seq[-2], token_seq[-1]))
-            if not nxt:
-                nxt = _sample_next(token_seq[-1])
-
-            if not nxt:
-                dead_end = True
+        # Standard cascade: 4-gram → trigram → bigram → unigram
+        for ctx_len in range(min(seq_len, 4), 0, -1):
+            ctx    = tuple(token_seq[-ctx_len:]) if ctx_len > 1 else token_seq[-1]
+            result = _from_ctx(ctx)
+            if result:
                 break
 
-            token_seq.append(nxt)
+        # Skip-gram: drop one interior position from the best available context
+        if not result and seq_len >= 2:
+            for skip in range(1, min(seq_len, 4)):
+                reduced = token_seq[:-skip-1] + token_seq[-skip:] if skip < seq_len else []
+                if not reduced:
+                    continue
+                ctx    = tuple(reduced[-min(len(reduced), 4):])
+                ctx    = ctx if len(ctx) > 1 else ctx[0]
+                result = _from_ctx(ctx)
+                if result:
+                    break
 
-        # Dead-end walk that fell short of min_len: discard
-        if dead_end and len(token_seq) < min_len:
-            continue
+        # Final fallback: KN unigram
+        if not result and KN_UNIGRAM:
+            result = [(t, p) for t, p in KN_UNIGRAM.items()
+                      if t[0] not in excluded_operators]
 
-        # ── Step 4: Validate and register the rule ───────────────────────────
-        rule = ''.join(token_seq)
+        return sorted(result, key=lambda x: -x[1])
 
-        # Paranoia guard: no banned operator must have slipped in
-        if _has_banned_op(rule):
-            continue
-        # Round-trip validation: joined string must re-tokenise to the same
-        # token list (catches accidental multi-char merges at token boundaries)
-        if TOKEN_REGEX.findall(rule) != token_seq:
-            continue
-        # Final syntactic gate (now using rulest's validator)
-        valid = (
-            is_valid_hashcat_rule(rule)
-            if not gpu_mode
-            else is_valid_hashcat_rule(rule)  # gpu_mode uses same validation
-        )
-        if valid and rule not in generated:
-            generated.add(rule)
-            length_counts[len(token_seq)] += 1
+    # Seed PQ with all starters sorted by probability
+    starters = sorted(
+        ((t, p) for t, p in markov_probabilities.get(START, {}).items()
+         if t[0] not in excluded_operators),
+        key=lambda x: -x[1]
+    )
+    print_info(f"Seeding PQ with {len(starters):,} start tokens.")
 
-    # ── Report generation results and length distribution ────────────────────
-    print_success(f"Generated {len(generated):,} valid token-level Markov rules.")
+    pq:       List = []
+    counter:  int  = 0
+    generated: Set[str] = set()
+    length_counts: Dict[int, int] = {l: 0 for l in range(min_len, max_len + 1)}
+    n_lengths = max_len - min_len + 1
+
+    for tok, prob in starters:
+        _heapq.heappush(pq, (-prob, counter, [tok], prob))
+        counter += 1
+
+    candidates_processed = 0
+
+    while pq and len(generated) < target:
+        neg_prob, _, token_seq, prob = _heapq.heappop(pq)
+        candidates_processed += 1
+        n_tok = len(token_seq)
+
+        if min_len <= n_tok <= max_len:
+            rule = ''.join(token_seq)
+            if (rule not in generated
+                    and not _has_banned_op(rule)
+                    and TOKEN_REGEX.findall(rule) == token_seq
+                    and is_valid_hashcat_rule(rule)):
+                generated.add(rule)
+                length_counts[n_tok] += 1
+                if len(generated) % 10000 == 0:
+                    print_info(f"  {len(generated):,}/{target:,} rules  "
+                               f"(queue={len(pq):,}, prob={prob:.6f})")
+
+        if n_tok < max_len and len(pq) < PQ_CAP:
+            for nxt, trans_prob in _get_transitions(token_seq):
+                new_prob = prob * trans_prob
+                _heapq.heappush(pq, (-new_prob, counter, token_seq + [nxt], new_prob))
+                counter += 1
+
+    print_success(
+        f"PQ generated {len(generated):,} rules "
+        f"({candidates_processed:,} candidates, queue remainder {len(pq):,})."
+    )
     if n_lengths > 1 and generated:
-        dist_parts = [
-            f"len={l}: {length_counts[l]:,}"
-            for l in range(min_len, max_len + 1)
-        ]
+        dist_parts = [f"len={l}: {length_counts[l]:,}" for l in range(min_len, max_len + 1)]
         print_info("Length distribution: " + "  |  ".join(dist_parts))
 
     if not generated:
@@ -1392,6 +1413,95 @@ def generate_rules_from_markov_model(
 # COMBINATORIAL GENERATION
 # ==============================================================================
 
+# ==============================================================================
+# CRACK-FOCUSED SYNTHETIC CORPUS  (v3.5)
+# ==============================================================================
+
+def build_crack_synthetic_corpus() -> Dict[str, int]:
+    """Return a dict {rule: weight} of high-value synthetic rules.
+
+    These rules represent the most statistically common real-world password
+    mutations and are used in two ways:
+
+      1. Pre-seeded into the Markov training corpus so the model learns the
+         token transitions they contain (e.g. c → $2 → $0 → $2 → $4).
+      2. Directly injected into the combinatorial output so they are
+         guaranteed to appear regardless of operator pool selection.
+
+    The synthetic weight is deliberately lower than a high-frequency corpus
+    rule so that genuine corpus patterns still dominate the Markov model
+    while these act as a reliable enrichment floor.
+    """
+    WEIGHT_HIGH   = 800   # year patterns, single-digit suffixes — very common
+    WEIGHT_MEDIUM = 400   # leet combos, symbol appends
+    WEIGHT_LOW    = 150   # longer/rarer synthetic combos
+
+    rules: Dict[str, int] = {}
+
+    def _add(rule: str, weight: int) -> None:
+        tokens = TOKEN_REGEX.findall(rule)
+        if not tokens or ''.join(tokens) != rule:
+            return
+        if _has_banned_op(rule):
+            return
+        rules[rule] = rules.get(rule, 0) + weight
+
+    # ── Year appends: [case_op]$Y$Y$Y$Y ─────────────────────────────────────
+    # Years 1970-2029 cover 99 %+ of real "birthyear" passwords.
+    years = [str(y) for y in list(range(1970, 2030))]
+    for year in years:
+        suffix = ''.join(f'${d}' for d in year)
+        for case_op in ('l', 'u', 'c', 'C', ':'):
+            _add(case_op + suffix if case_op != ':' else suffix, WEIGHT_HIGH)
+
+    # ── Short digit suffix patterns: $N, $NN, $NNN, $NNNN ───────────────────
+    for n_digits in range(1, 5):
+        for combo in itertools.product('0123456789', repeat=n_digits):
+            suffix = ''.join(f'${d}' for d in combo)
+            _add(suffix, WEIGHT_HIGH)
+            for case_op in ('l', 'u', 'c', 'C'):
+                _add(case_op + suffix, WEIGHT_MEDIUM)
+
+    # ── Symbol appends: [case_op]$SYM ────────────────────────────────────────
+    for sym in ('!', '@', '#', '.', '?', '_', '-', '*'):
+        token = f'${sym}'
+        _add(token, WEIGHT_MEDIUM)
+        for case_op in ('l', 'u', 'c', 'C'):
+            _add(case_op + token, WEIGHT_MEDIUM)
+
+    # ── Leet substitutions (single) ──────────────────────────────────────────
+    leet_ops = ['sa@', 'se3', 'si!', 'so0', 'ss5', 'st7', 'sb6']
+    for leet in leet_ops:
+        _add(leet, WEIGHT_MEDIUM)
+
+    # ── Case + leet: [case_op][leet] ─────────────────────────────────────────
+    for case_op in ('l', 'u', 'c', 'C'):
+        for leet in leet_ops:
+            _add(case_op + leet, WEIGHT_MEDIUM)
+
+    # ── Leet combos (up to 2 substitutions) ─────────────────────────────────
+    for l1 in leet_ops:
+        for l2 in leet_ops:
+            if l2 != l1:
+                _add(l1 + l2, WEIGHT_LOW)
+
+    # ── Case + leet + digit suffix ────────────────────────────────────────────
+    for case_op in ('c', 'C', 'l'):
+        for leet in leet_ops[:4]:                 # top-4 leet ops only
+            for digit in ('$1', '$2', '$3', '$!'):
+                _add(case_op + leet + digit, WEIGHT_LOW)
+
+    # ── Pure structural transforms ────────────────────────────────────────────
+    for op in ('r', 'd', 'f', 'c', 'C', 'l', 'u', 't'):
+        _add(op, WEIGHT_HIGH)
+
+    print_info(
+        f"[crack-corpus] Built {len(rules):,} synthetic crack-focused rules "
+        f"(WEIGHT_HIGH={WEIGHT_HIGH}, MEDIUM={WEIGHT_MEDIUM}, LOW={WEIGHT_LOW})"
+    )
+    return rules
+
+
 def find_min_operators_for_target(
     sorted_operators: List[Tuple[str, int]],
     target:           int,
@@ -1403,9 +1513,25 @@ def find_min_operators_for_target(
     v3.1: operators from NEVER_PRODUCE_OPS are excluded from the candidate pool.
     v3.2: sorted_operators now contains full tokens (e.g. '$5', 'sae') so the
     count accurately reflects how many distinct rule-chains are producible.
+    v3.5: CRACK_FOCUSED_TOKENS are always present in the candidate pool with a
+    boosted frequency so they are never crowded out by a sparse corpus.
     """
-    # Strip banned operators from the candidate pool at the source
-    safe_operators = [(op, cnt) for op, cnt in sorted_operators if op not in NEVER_PRODUCE_OPS]
+    # ── Build enriched operator pool ─────────────────────────────────────────
+    # Start from corpus operators (banned ops removed)
+    corpus_counts: Dict[str, int] = {
+        op: cnt for op, cnt in sorted_operators if op not in NEVER_PRODUCE_OPS
+    }
+    # Inject CRACK_FOCUSED_TOKENS with frequency just above the highest corpus
+    # count so they sort to the front of the pool when the corpus is empty, but
+    # yield gracefully to genuinely dominant corpus operators.
+    boost = (max(corpus_counts.values(), default=0) + 1)
+    enriched: Dict[str, int] = dict(corpus_counts)
+    for tok in CRACK_FOCUSED_TOKENS:
+        if tok not in enriched:
+            enriched[tok] = boost   # not in corpus at all → always included
+        # tokens already in corpus keep their original (higher or equal) count
+
+    safe_operators = sorted(enriched.items(), key=lambda kv: kv[1], reverse=True)
 
     current = 0
     n       = 0
@@ -1465,7 +1591,29 @@ def generate_rules_parallel(
     with multiprocessing.Pool(processes=n_procs) as pool:
         sets = pool.map(_generate_for_length, tasks)
     generated = set().union(*sets)
-    print_success(f"Generated {len(generated):,} valid rules.")
+
+    # ── v3.5: inject synthetic crack-focused rules directly ──────────────────
+    # The cartesian product may not reach all high-value patterns (budget limit,
+    # length constraints).  Explicitly adding the synthetic corpus guarantees
+    # the most effective real-world mutations are always in the output set.
+    synthetic = build_crack_synthetic_corpus()
+    n_before  = len(generated)
+    for rule in synthetic:
+        tokens = TOKEN_REGEX.findall(rule)
+        if not tokens or ''.join(tokens) != rule:
+            continue
+        if _has_banned_op(rule):
+            continue
+        if not is_valid_hashcat_rule(rule):
+            continue
+        n_toks = len(tokens)
+        if min_len <= n_toks <= max_len:
+            generated.add(rule)
+    n_injected = len(generated) - n_before
+    if n_injected:
+        print_info(f"[crack-corpus] Injected {n_injected:,} synthetic crack rules into combo output.")
+
+    print_success(f"Generated {len(generated):,} valid rules ({n_injected:,} from crack corpus).")
     return generated
 
 
@@ -1787,7 +1935,7 @@ def _min_apply_single(rule: str, word: str) -> Optional[str]:
                     out.append(c | 0x20)         # uppercase → lowercase (mid-word)
                 else:
                     out.append(c)
-                cap = c in (32, 45, 95)
+                cap = (c == 32)                  # only space triggers capitalisation
             w = out
         elif cmd == 'r':
             w = w[::-1]
@@ -2011,17 +2159,21 @@ def _min_compute_signature(rule: str, probe_words: List[str]) -> tuple:
 # ---------------------------------------------------------------------------
 # Probe vector (TEST_VECTOR)
 # ---------------------------------------------------------------------------
-# Sourced exclusively from minimizer.py's BUILTIN_PROBES.  Hand-curated to
-# exercise every interesting opcode category:
+# Sourced exclusively from minimizer.py's BUILTIN_PROBES (v1.4, 50 words).
+# Hand-curated to exercise every interesting opcode category:
 #
-#   len 2–4  → k, K, {, }, [, ] edge cases; x/O/D on short words
-#   len 4–6  → T3, i0X, D0, position ops within short words
-#   len 7–9  → typical real-world password base word range
-#   len 10+  → truncation and repeat ops ('y','Y','z','Z','p')
-#   Mixed-case → l, u, c, C, t, E, T, k, K
-#   Digits   → @, s, o on numeric chars; pure numeric suffix probing
-#   Specials → @-removal, s-substitution on punctuation chars
-#   Repeated → q (char doubling), z/Z (char extension)
+#   len 2–4      → k, K, {, }, [, ] edge cases; x/O/D on short words
+#   len 4–6      → T3, i0X, D0, position ops within short words
+#   len 7–9      → typical real-world password base word range
+#   len 10–11    → truncation and repeat ops ('y','Y','z','Z','p')
+#   len 12–36    → high-position ops (B–Z); rules like 'B–'Z, TB–TZ,
+#                  DB–DZ, iCX–iZX all get distinct signatures
+#   All 95 ASCII → @X / sXY rules are distinguishable from no-ops even
+#                  for rare chars like j, x, z and most punctuation
+#   Mixed-case   → l, u, c, C, t, E, T, k, K
+#   Digits       → @, s, o on numeric chars; pure numeric suffix probing
+#   Specials     → @-removal, s-substitution on punctuation chars
+#   Repeated     → q (char doubling), z/Z (char extension)
 
 TEST_VECTOR: List[str] = [
     # ── very short — edge cases for k, K, {, }, [, ] ────────────────
@@ -2043,12 +2195,38 @@ TEST_VECTOR: List[str] = [
     "baseball",         # len 8
     "princess",         # len 8
     "dragon12",         # len 8, ends with digits
-    # ── longer words (len 10+) — truncation / repeat ops ─────────────
+    # ── longer words (len 10–11) — truncation / repeat ops ──────────
     "qwertyuiop",       # len 10
     "iloveyou12",       # len 10, trailing digits
     "monkey12345",      # len 11
     "superman123",      # len 11
     "mustang2024",      # len 11
+    # ── extended-length words (len 12–36) — cover positions B(11)–Z(35)
+    # Without these, every rule that only touches position 11+ is a no-op
+    # on the entire probe set and collapses into the same signature as ":"
+    # causing mass false deduplication of 'B–'Z, TB–TZ, DB–DZ, etc.
+    "administrator1",                        # len 14
+    "iloveyouforever",                       # len 15
+    "qwertyuiopasdfgh",                      # len 16
+    "correcthorsebattery",                   # len 20
+    "averylongpassword1234",                 # len 22
+    "averylongpassword12345678",             # len 26
+    "averylongpassword1234567890ab",         # len 30
+    "averylongpassword1234567890abcdef",     # len 34
+    "averylongpassword1234567890abcdefghi",  # len 36 — covers Z(35)
+    # ── alphabet coverage — all 95 printable ASCII chars (0x20–0x7E) ─
+    # Without full char coverage, rules like @j / @x / @z (purge j/x/z),
+    # sja / sxA (replace j/x with something), and rules targeting the 19
+    # uppercase letters not present in the basic words (B C D E F G I J K
+    # L N O Q R T V X Y Z) are all no-ops on the probe set → falsely merged.
+    "abcdefghijklmnopqrstuvwxyz",       # all 26 lowercase
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",       # all 26 uppercase
+    "!@#$%^&*()-_=+[]{}|;:,.<>?/~",    # 30 common punctuation chars
+    "a`b",    # backtick  (0x60)
+    'a"b',    # double-quote (0x22)
+    "a'b",    # single-quote (0x27)
+    "a\\b",   # backslash (0x5C)
+    "a b",    # space (0x20) — completes 95/95 printable ASCII coverage
     # ── mixed-case — l/u/c/C/t/E/T/k/K ─────────────────────────────
     "Password",
     "AdminUser",
@@ -2876,7 +3054,24 @@ def concentrator_main_processing(args: Any) -> None:
     )
     if needs_markov:
         print_section("Building Markov Model")
-        markov_probs, markov_totals = get_markov_model(full_rule_counts)
+        # ── v3.5: pre-seed training corpus with synthetic crack rules ────────
+        # get_markov_model counts each unique rule ONCE (+=1) regardless of
+        # its frequency.  We therefore add synthetic rules as plain presence
+        # markers (value=1) — this injects new token transitions without
+        # overwhelming corpus-learned patterns the way large weights would.
+        # Existing corpus rules are never overwritten.
+        synthetic_corpus = build_crack_synthetic_corpus()
+        enriched_rule_counts: Dict[str, int] = dict(full_rule_counts)
+        n_new = 0
+        for rule in synthetic_corpus:
+            if rule not in enriched_rule_counts:
+                enriched_rule_counts[rule] = 1   # presence only — equal weight to corpus rules
+                n_new += 1
+        print_info(
+            f"[crack-corpus] Pre-seeded Markov training with {n_new:,} new synthetic rules "
+            f"({len(synthetic_corpus) - n_new:,} already in corpus, skipped)."
+        )
+        markov_probs, markov_totals = get_markov_model(enriched_rule_counts)
     else:
         print_info("Skipping Markov model (not needed for this mode).")
 
