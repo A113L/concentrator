@@ -658,7 +658,7 @@ def memory_intensive_operation_warning(operation_name: str) -> bool:
             resp = input(
                 f"{Colors.YELLOW}Continue with memory-intensive operation? (y/N): {Colors.END}"
             ).strip().lower()
-            return resp not in ('n', 'no')
+            return resp in ('y', 'yes')
         else:
             print(f"{Colors.YELLOW}System will use swap. Performance may degrade.{Colors.END}")
     return True
@@ -788,7 +788,7 @@ def is_valid_hashcat_rule(rule: str) -> bool:
                 pos += 1
             continue
         # Zero-argument operators
-        if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'a', 'q', 'k', 'K',
+        if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'q', 'k', 'K',
                  'E', '{', '}', '[', ']'):
             pos += 1
             cnt += 1
@@ -1151,9 +1151,13 @@ def get_markov_model(
             counts[ctx][tokens[i + 2]] += 1
             continuation_contexts[tokens[i + 2]].add(ctx)
         for i in range(n - 3):
-            counts[(tokens[i], tokens[i+1], tokens[i+2])][tokens[i+3]] += 1
+            ctx3 = (tokens[i], tokens[i+1], tokens[i+2])
+            counts[ctx3][tokens[i+3]] += 1
+            continuation_contexts[tokens[i+3]].add(ctx3)
         for i in range(n - 4):
-            counts[(tokens[i], tokens[i+1], tokens[i+2], tokens[i+3])][tokens[i+4]] += 1
+            ctx4 = (tokens[i], tokens[i+1], tokens[i+2], tokens[i+3])
+            counts[ctx4][tokens[i+4]] += 1
+            continuation_contexts[tokens[i+4]].add(ctx4)
 
     if skipped:
         print_warning(f"Markov training: skipped {skipped:,} rules that did not tokenize cleanly.")
@@ -1564,9 +1568,6 @@ def _generate_for_length(args: Tuple) -> Set[str]:
         if reparsed != list(combo):
             invalid_concat += 1
             continue
-        if gpu_mode:
-            if not is_valid_hashcat_rule(rule):
-                continue
         generated.add(rule)
     return generated
 
@@ -1672,6 +1673,8 @@ class RuleEngine:
         elif op == 'd':
             return word + word
         elif op == 'p':
+            if not args:
+                return word
             return word * (_i36(args[0]) + 1)
         elif op == 'f':
             return word + word[::-1]
@@ -1792,26 +1795,31 @@ class RuleEngine:
             n = _i36(args[0])
             return word + word[-n:] if word else word
         elif op == 'E':
-            # Title-case: lowercase everything, then uppercase after space/hyphen/underscore
+            # Title-case: lowercase everything, then uppercase after space only.
+            # Hashcat's E opcode uses only ASCII space (0x20) as the word separator.
             out = []
             cap = True
             for ch in word:
-                if cap:
+                if cap and ch.islower():
                     out.append(ch.upper())
-                else:
+                elif not cap and ch.isupper():
                     out.append(ch.lower())
-                cap = ch in (' ', '-', '_')
+                else:
+                    out.append(ch)
+                cap = (ch == ' ')
             return ''.join(out)
         elif op == 'e':
-            # Title-case with custom separator: lowercase everything, then uppercase after sep
+            # Title-case with custom separator: lowercase everything, then uppercase after sep.
             sep = args[0]
             out = []
             cap = True
             for ch in word:
-                if cap:
+                if cap and ch.islower():
                     out.append(ch.upper())
-                else:
+                elif not cap and ch.isupper():
                     out.append(ch.lower())
+                else:
+                    out.append(ch)
                 cap = (ch == sep)
             return ''.join(out)
         else:
@@ -1866,7 +1874,9 @@ _TWO_ARG_OPS_MIN  = frozenset(['s', 'i', 'o', 'x', 'O', '*', '3'])
 # two different unsupported rules are never mistakenly identified as duplicates.
 # The old constant ('__UNSUPPORTED__',) caused all unsupported rules to share
 # one bucket — e.g. 200 reject-op rules (<, >, !, /, …) collapsed to 1 kept rule.
-_UNSUPPORTED_SIG: tuple = ('__UNSUPPORTED__',)
+# NOTE: _UNSUPPORTED_SIG is kept for reference only; always use _min_compute_signature
+# to generate the actual per-rule sentinel ('__UNSUPPORTED__', rule_text).
+_UNSUPPORTED_SIG_PREFIX: str = '__UNSUPPORTED__'
 
 
 def _is_unsupported_sig(sig: tuple) -> bool:
