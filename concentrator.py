@@ -3,205 +3,6 @@
 from __future__ import annotations  # Python 3.8+ type-hint compatibility
 """
 CONCENTRATOR v3.5 - Unified Hashcat Rule Processor
-
-Changes from v3.4 → v3.5
-─────────────────────────
-1. Fourth-order token-level Markov model (get_markov_model)
-   Training now records four context lengths instead of two:
-
-     START → first_token                          key: '^'
-     token_i → token_{i+1}                        key: token_i        (unigram)
-     (token_{i-1}, token_i) → token_{i+1}         key: 2-tuple        (bigram)
-     (token_{i-2..i}) → token_{i+1}               key: 3-tuple        (trigram)
-     (token_{i-3..i}) → token_{i+1}               key: 4-tuple        (4-gram)
-
-   The summary printout now reports all four context counts separately:
-   "N unigram, M bigram, P trigram, Q 4-gram contexts."
-
-2. Extended scoring cascade (get_markov_weighted_rules)
-   Log-probability scoring now tries contexts in order of decreasing length:
-     4-gram → trigram → bigram → unigram
-   The longest available context wins at each position.  Rules scored under a
-   longer context receive higher discrimination; the cascade falls back
-   gracefully when the model is sparse (small corpus / short rules).
-
-3. Extended generation cascade (generate_rules_from_markov_model)
-   The random walk now uses the same 4-gram → trigram → bigram → unigram
-   cascade when extending a token sequence.  For default max_len=3 the
-   behaviour is identical to v3.4 (trigram/4-gram contexts cannot fire before
-   the walk terminates); the improvement is visible at max_len >= 5.
-
-Changes from v3.4 → v3.5
-─────────────────────────
-Synchronised TEST_VECTOR and _min_apply_single engine with minimizer.py v1.4.
-
-1. TEST_VECTOR extended from 33 → 50 words (matching minimizer.py BUILTIN_PROBES)
-
-   a. Extended-length words (len 12–36) added.
-      Without words of length ≥ 12, every rule touching position 11+ (opcodes
-      'B–'Z, TB–TZ, DB–DZ, LB–LZ, RB–RZ, +B–+Z, -B–-Z, iCX–iZX, oNX for
-      N ≥ 11, etc.) is a no-op on the entire probe set and collapses into the
-      same signature as ":", causing mass false deduplication.  Nine words of
-      lengths 14, 15, 16, 20, 22, 26, 30, 34, 36 now cover positions B(11)
-      through Z(35) inclusively.
-
-   b. Alphabet-coverage words added.
-      The previous probe set was missing lowercase letters j, x, z and 19
-      uppercase letters (B C D E F G I J K L N O Q R T V X Y Z), plus almost
-      all punctuation characters.  Rules like @j, @x, @z (purge), sja, sxA
-      (replace), and all rules whose target character appeared in none of the
-      probe words were indistinguishable from no-ops.  Eight new words now
-      provide complete coverage of all 95 printable ASCII code-points (0x20–0x7E):
-        "abcdefghijklmnopqrstuvwxyz"   — all 26 lowercase
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"   — all 26 uppercase
-        "!@#$%^&*()-_=+[]{}|;:,.<>?/~" — 30 common punctuation chars
-        "a`b"  "a\"b"  "a'b"  "a\\b"  "a b"  — backtick, quotes, backslash, space
-
-2. E opcode separator fix (_min_apply_single)
-   cap was set to `c in (32, 45, 95)` (space, hyphen, underscore).  Hashcat's E
-   opcode uses only ASCII space (0x20) as the word separator.  Fixed: cap = (c == 32).
-   The incorrect separators produced wrong signatures for words containing
-   hyphens or underscores.
-
-Changes from v3.3 → v3.4
-─────────────────────────
-Synchronised the internal minimizer engine with minimizer.py fixes.
-Both tools now produce identical functional signatures on all probe words.
-
-1. x opcode — corrected semantics (both RuleEngine and _min_apply_single)
-   xNM extracts M characters starting at position N: w[N : N+M].
-   Previous implementation treated M as an end-index: w[N : M+1] and
-   additionally swapped N↔M when N > M, producing wrong results.
-
-2. O opcode — corrected semantics (RuleEngine)
-   ONM deletes M characters starting at position N: w[:N] + w[N+M:].
-   Previous implementation treated M as an end-index of a range s..e.
-
-3. ' opcode — off-by-one fixed (both RuleEngine and _min_apply_single)
-   'N keeps exactly N characters: w[:N].
-   Previous implementation kept N+1 characters: w[:N+1].
-
-4. E opcode — missing lowercase step (both RuleEngine and _min_apply_single)
-   E must first lowercase the entire word, then uppercase the first letter
-   and every letter that follows a space (32), hyphen (45), or underscore (95).
-   Previous implementation only uppercased word-start letters, leaving
-   mid-word uppercase letters untouched ("hELLO" → "HELLO" instead of "Hello").
-
-5. e opcode — same missing lowercase step (both engines)
-   Same fix as E, applied to the custom-separator variant.
-
-6. 3 opcode — off-by-one in separator counter (_min_apply_single)
-   3NX toggles the letter after the Nth separator (N is 0-based).
-   cnt was incremented before the comparison, so n=0 (first separator)
-   required cnt==0 after incrementing — impossible. Fixed: compare cnt==n+1.
-
-7. dg() — added A-Z position support (_min_apply_single)
-   Hashcat uses base-36 positions: 0-9 for 0-9 and A-Z for 10-35.
-   dg() only handled 0-9, silently returning -1 for letter positions,
-   turning rules like DA (delete at pos 10) into no-ops.
-
-8. _UNSUPPORTED_SIG — unique sentinel per rule (both dedup paths)
-   All unsupported-opcode rules previously shared the same sentinel
-   ('__UNSUPPORTED__',), causing false deduplication: 200 reject-op rules
-   (<, >, !, /, …) collapsed to 1 kept rule. Each rule now gets a unique
-   sentinel ('__UNSUPPORTED__', rule_text). The _is_unsupported_sig() helper
-   detects any variant. Both the in-memory and SQLite dedup paths updated.
-
-9. SQLite dedup — indexable TEXT key (sha256) instead of BLOB
-   Signature blobs were stored as BLOB PRIMARY KEY. SQLite cannot build a
-   B-tree index on BLOB columns, forcing a full table scan on every INSERT.
-   Now a SHA-256 hex digest (64-char TEXT) is used as the key — fully
-   indexable, dramatically faster on large rulesets.
-
-─────────────────────────
-1. Full token-level Markov model (get_markov_model)
-   The model is now built on atomic hashcat TOKENS produced by TOKEN_REGEX
-   (e.g. 'l', '$5', 'sae', 'T3') instead of raw characters.  Three
-   transition tables are maintained:
-
-     START → first_token          (key: '^')
-     token_i → token_{i+1}        (key: token string, unigram context)
-     (token_{i-1}, token_i) →     (key: 2-tuple of token strings, bigram ctx)
-         token_{i+1}
-
-   Only rules that pass the round-trip tokenisation check are used for
-   training, so the model is never confused by partially-tokenisable input.
-   The function now prints a summary of how many start/unigram/bigram
-   contexts were learned.
-
-2. Token-level rule scoring (get_markov_weighted_rules)
-   Log-probability scoring now operates on TOKEN sequences, not characters.
-   Scoring strategy: P(tok[0]|START) × ∏ P(tok[i]|bigram or unigram ctx).
-   Rules that do not tokenise cleanly are silently skipped.
-
-3. Token-level Markov walk (generate_rules_from_markov_model)
-   The random walk now samples full TOKENS at every step, replacing the old
-   character-by-character walk.  Key improvements:
-
-   • min_len / max_len count TOKENS (operators), not raw bytes.  This is the
-     natural measure of rule complexity for hashcat (a rule with 3 tokens is
-     exactly 3 chained operators regardless of argument byte lengths).
-   • Every walk candidate is structurally valid — concatenating valid tokens
-     always produces a valid rule — so the rejection rate is near zero
-     compared to the old character-level walk.
-   • Banned operators (NEVER_PRODUCE_OPS) are excluded at sampling time;
-     the _has_banned_op() paranoia check and the TOKEN_REGEX round-trip gate
-     are still applied before any rule is accepted.
-   • Budget increased to target × 20 attempts (was × 5) to compensate for
-     potentially smaller Markov graphs when only real operators are nodes.
-
-Changes from v3.1 → v3.2
-─────────────────────────
-1. Full-token analysis (process_single_file)
-   Operator counting now uses TOKEN_REGEX.findall so that each full token
-   (e.g. '$5', 'sae', 'T3') is counted as one atomic unit instead of
-   counting the operator byte and its argument bytes independently.
-   This means find_min_operators_for_target works on the correct token pool
-   and combinatorial counts accurately reflect producible rule-chains.
-
-2. Round-trip re-parse validation gate (_generate_for_length)
-   After joining a token combination into a rule string, the string is
-   re-tokenised with TOKEN_REGEX.  The result must equal the original token
-   list exactly.  This catches any case where two adjacent tokens accidentally
-   merge into a different longer operator at the string boundary.
-   Any combination that fails this round-trip check is silently dropped.
-
-3. Python 3.8+ compatibility
-   Added `from __future__ import annotations` so that PEP-604 / PEP-585
-   style hints (list[str], dict[str, int] …) work on Python 3.8 and 3.9
-   without raising TypeError at import time.
-
-Changes from v3.0 → v3.1
-─────────────────────────
-1. NEVER_PRODUCE_OPS  — single, authoritative constant that lists every operator
-   (memory: M 4 6 X  and  reject: < > ! / ( ) = % Q) that must NEVER appear in
-   any produced/extracted/generated output, regardless of CPU/GPU mode.
-   Previously these were only blocked in GPU mode via _GPU_DENIED_OPS; now they
-   are filtered at *every* processing stage:
-     • process_single_file   – skips any loaded rule that contains a banned op
-     • gpu_extract_and_validate_rules – post-validation filter
-     • find_min_operators_for_target / combinatorial generation – banned ops
-       stripped from the operator pool before combinations are built
-     • generate_rules_from_markov_model – uses NEVER_PRODUCE_OPS (replaces the
-       now-removed EXCLUDED_MARKOV_OPERATORS constant)
-     • HashcatRuleCleaner.validate_rule (both modes) – always rejects banned ops
-     • save_rules – final safety net, drops any slipped-through rule
-
-2. Unified TEST_VECTOR (sourced from minimizer.py BUILTIN_PROBES)
-   The TEST_VECTOR is now drawn exclusively from minimizer.py's BUILTIN_PROBES
-   so that both tools compute signatures against an identical word set.  The
-   shared probe set (50 words as of v1.4) covers:
-     • lengths 2–36  (exercises position ops across short, medium, and long words)
-     • all 95 printable ASCII code-points (complete @X / sXY rule coverage)
-     • all-lowercase, mixed-case, embedded-digit, and special-char words
-     • repeated-character strings (aaaa, bbbb)
-   Using a single canonical probe set ensures that a rule minimized by
-   minimizer.py will never collide differently in concentrator.py.
-
-3. Minor clean-ups
-   • _GPU_DENIED_OPS removed (replaced by NEVER_PRODUCE_OPS)
-   • EXCLUDED_MARKOV_OPERATORS removed (was identical to _GPU_DENIED_OPS)
-   • _has_banned_op() helper added
 """
 
 import sys
@@ -223,6 +24,18 @@ import pickle
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Callable, Any, Set, Optional
+
+# -----------------------------------------------------------------------------
+# Windows terminal color support (ANSI → WinAPI conversion)
+# -----------------------------------------------------------------------------
+if sys.platform == 'win32':
+    try:
+        import colorama
+        colorama.init()                     # converts ANSI codes to Windows calls
+    except ImportError:
+        # Fallback: no conversion – ANSI codes may appear raw in older consoles
+        # but modern Windows Terminal / PowerShell 7+ support them natively.
+        pass
 
 # ---------------------------------------------------------------------------
 # Third-party imports with fallbacks
@@ -299,7 +112,7 @@ STATE = AppState()
 
 
 # ==============================================================================
-# COLORS
+# COLORS (ANSI codes – converted on Windows if colorama is present)
 # ==============================================================================
 
 class Colors:
