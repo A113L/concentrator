@@ -3,6 +3,7 @@
 from __future__ import annotations  # Python 3.8+ type-hint compatibility
 """
 CONCENTRATOR v3.5 - Unified Hashcat Rule Processor
+
 """
 
 import sys
@@ -2790,11 +2791,14 @@ def enhanced_interactive_processing_loop(
 # ==============================================================================
 
 def process_multiple_files_concentrator(args: Any) -> None:
+    global STATE
     print_header("PROCESSING MODE – Interactive Rule Minimization")
     all_fps = find_rule_files_recursive(args.paths, max_depth=3)
     if not all_fps:
         print_error("No rule files found.")
         return
+    STATE.output_format = args.output_format if args.output_format in ('line', 'expanded') else 'line'
+    print(f"{Colors.CYAN}Output Format:{Colors.END} {STATE.output_format}")
     set_global_flags(args.temp_dir, args.in_memory)
     sorted_ops, full_rule_counts, _ = analyze_rule_files_parallel(all_fps, args.max_length)
     if not full_rule_counts:
