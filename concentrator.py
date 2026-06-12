@@ -1607,7 +1607,9 @@ class RuleEngine:
             return word[:n] + word if word else word
         elif op == 'Y':
             n = _i36(args[0])
-            return word + word[-n:] if word else word
+            if n <= 0 or not word:
+                return word
+            return word + word[-n:]
         elif op == 'E':
             # Title-case: lowercase everything, then uppercase after space only.
             # Hashcat's E opcode uses only ASCII space (0x20) as the word separator.
