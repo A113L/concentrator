@@ -2778,10 +2778,16 @@ def enhanced_interactive_processing_loop(
 
     except KeyboardInterrupt:
         print(f"\n{Colors.YELLOW}Interactive menu interrupted.{Colors.RESET}")
-        if input(
-            f"{Colors.YELLOW}Save before exiting? (y/N): {Colors.RESET}"
-        ).strip().lower() in ('y', 'yes'):
-            save_rules(current_data, mode_name=f"{initial_mode}_filtered")
+        try:
+            if input(
+                f"{Colors.YELLOW}Save before exiting? (y/N): {Colors.RESET}"
+            ).strip().lower() in ('y', 'yes'):
+                save_rules(current_data, mode_name=f"{initial_mode}_filtered")
+        except EOFError:
+            pass
+    except EOFError:
+        print(f"\n{Colors.YELLOW}Input closed — exiting interactive menu and saving current dataset.{Colors.RESET}")
+        save_rules(current_data, mode_name=f"{initial_mode}_filtered")
 
     return current_data
 
@@ -2962,9 +2968,12 @@ def concentrator_main_processing(args: Any) -> None:
     print(f"\n{Colors.CYAN}{Colors.BOLD}" + "=" * 60)
     print("ENHANCED PROCESSING OPTIONS")
     print("=" * 60 + f"{Colors.END}")
-    enter_interactive = input(
-        f"\n{Colors.YELLOW}Enter enhanced interactive mode? (Y/n): {Colors.RESET}"
-    ).strip().lower()
+    try:
+        enter_interactive = input(
+            f"\n{Colors.YELLOW}Enter enhanced interactive mode? (Y/n): {Colors.RESET}"
+        ).strip().lower()
+    except EOFError:
+        enter_interactive = 'n'
 
     if enter_interactive not in ('n', 'no'):
         total_lines = sum(full_rule_counts.values())
