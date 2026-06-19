@@ -1818,10 +1818,14 @@ def _min_apply_single(rule: str, word: str) -> Optional[str]:
         elif cmd == '-' and len(rule) >= 2:
             p = dg(rule[1])
             if 0 <= p < len(w): w[p] = (w[p] - 1) & 0xFF
-        elif cmd in ('.', ',') and len(rule) >= 2:
-            p     = dg(rule[1])
-            delta = 1 if cmd == '.' else -1
-            if 0 <= p < len(w): w[p] = (w[p] + delta) & 0xFF
+        elif cmd == '.' and len(rule) >= 2:
+            # .N — replace character @ N with the value of character @ N+1
+            p = dg(rule[1])
+            if 0 <= p < len(w) - 1: w[p] = w[p + 1]
+        elif cmd == ',' and len(rule) >= 2:
+            # ,N — replace character @ N with the value of character @ N-1
+            p = dg(rule[1])
+            if 0 < p < len(w): w[p] = w[p - 1]
         elif cmd == "'" and len(rule) >= 2:
             # 'N — keep only the first N characters (w[:N])
             p = dg(rule[1])
@@ -1837,7 +1841,7 @@ def _min_apply_single(rule: str, word: str) -> Optional[str]:
             if n > 0: w = w[:n] + w
         elif cmd == 'Y' and len(rule) >= 2:
             n = dg(rule[1])
-            if n > 0 and len(w) >= n: w = w + w[-n:]
+            if n > 0 and w: w = w + w[-n:]
         elif cmd == 's' and len(rule) >= 3:
             a = _min_arg_ord(rule, 1)
             b = _min_arg_ord(rule, 2 if rule[1] != '\\' else 5)
