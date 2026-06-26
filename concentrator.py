@@ -22,6 +22,7 @@ import threading
 import functools
 import sqlite3
 import pickle
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Callable, Any, Set, Optional
@@ -753,28 +754,24 @@ def gpu_validate_rules(rules_list: List[str], max_rule_length: int = 64) -> List
 # PARALLEL FILE PROCESSING
 # ==============================================================================
 
-def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
+def process_single_file(filepath: str, max_rule_length: int) -> Tuple[Dict[str, int], Dict[str, int], int]:
+    """Read one rule file and return (operator_counts, rule_counts, comment_lines).
+
+    v3.6 (FIX 1 from markov_rule_generator.py): this function no longer builds
+    a raw per-line list or writes a temp file.  The Markov pipeline — and all
+    other modes — only ever consume the deduplicated rule→count dict, so the
+    previous approach of collecting every raw line (either in RAM or via a
+    disk round-trip) was pure waste.  Peak memory is now O(unique rules), not
+    O(total lines), and there is nothing left to leak on Ctrl-C or crash.
+
+    Rules containing any operator from NEVER_PRODUCE_OPS are silently dropped.
+    Operator counting uses TOKEN_REGEX.findall so full tokens (e.g. '$5',
+    'sae', 'T3') are counted as atomic units.  Comment lines are counted
+    separately and never included in rule totals.
     """
-    Read one rule file and return:
-      (operator_counts, rule_counts, clean_rules_list, temp_filepath_or_None,
-       comment_lines)
-
-    v3.1: rules containing any operator from NEVER_PRODUCE_OPS are silently
-    dropped at this stage so they never enter the processing pipeline.
-
-    v3.2: operator counting now uses TOKEN_REGEX.findall so that full tokens
-    (e.g. '$5', 'sae', 'T3') are counted as atomic units instead of counting
-    the operator character and its argument bytes separately.
-
-    v3.5: comment lines (lines starting with '#') are counted separately and
-    returned as the fifth element of the tuple.  They are never included in
-    rule totals or occurrence statistics.
-    """
-    operator_counts:  Dict[str, int] = defaultdict(int)
-    full_rule_counts: Dict[str, int] = defaultdict(int)
-    clean_rules:      List[str]      = []
-    tmp_path:         Optional[str]  = None
-    comment_lines:    int            = 0
+    operator_counts: Dict[str, int] = defaultdict(int)
+    rule_counts:     Dict[str, int] = defaultdict(int)
+    comment_lines:   int            = 0
 
     try:
         with open(filepath, 'r', errors='ignore') as fh:
@@ -782,38 +779,9 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
                 line = line.strip()
                 if not line:
                     continue
-                # v3.5: count comment lines explicitly; never let them enter rule counts
                 if line.startswith('#'):
                     comment_lines += 1
                     continue
-
-                # ------------------------------------------------------------------
-                # Normalise to compact form.
-                #
-                # v3.5 fix: the previous approach filtered characters with
-                # ALL_RULE_CHARS and then checked len(line).  This had two bugs:
-                #
-                # 1.  ALL_RULE_CHARS was missing valid operator characters ({, },
-                #     _, ', \, …), so those characters were silently stripped,
-                #     corrupting any rule that used them.
-                #
-                # 2.  The length check ran on the *raw* line, so expanded-format
-                #     input (tokens separated by spaces, e.g. "sA- sS~ $1 $2")
-                #     was incorrectly rejected when the expanded form was longer
-                #     than max_rule_length even though the compact form was fine.
-                #
-                # Fix: use TOKEN_REGEX.findall() which:
-                #   • naturally ignores whitespace between tokens (spaces that are
-                #     token separators are simply not matched and are skipped)
-                #   • preserves whitespace that IS a literal character argument
-                #     (e.g. "sP " = replace P with space — the trailing space IS
-                #     part of the token and is included in the match)
-                #   • drops characters that are not part of any valid token
-                #     (truly malformed bytes), producing a clean compact form
-                #
-                # After findall we join tokens and apply the length limit on the
-                # resulting compact string, not on the original raw line.
-                # ------------------------------------------------------------------
                 tokens = TOKEN_REGEX.findall(line)
                 if not tokens:
                     continue
@@ -822,89 +790,56 @@ def process_single_file(filepath: str, max_rule_length: int) -> Tuple:
                     continue
                 if _has_banned_op(clean):
                     continue
-                # ------------------------------------------------------------------
-                full_rule_counts[clean] += 1
-                clean_rules.append(clean)
+                rule_counts[clean] += 1
                 for token in tokens:
                     operator_counts[token] += 1
-
-        if not STATE.in_memory_mode:
-            with tempfile.NamedTemporaryFile(
-                mode='w+', delete=False, encoding='utf-8',
-                dir=STATE.temp_dir_path, prefix='concentrator_', suffix='.tmp',
-            ) as tf:
-                tmp_path = tf.name
-                tf.writelines(r + '\n' for r in clean_rules)
-            with _cleanup_lock:
-                _temp_files_to_cleanup.append(tmp_path)
-            print_success(
-                f"Processed: {filepath} → {tmp_path}"
-                + (f" ({comment_lines:,} comment lines skipped)" if comment_lines else "")
-            )
-            return operator_counts, full_rule_counts, [], tmp_path, comment_lines
-        else:
-            print_success(
-                f"Processed (in-memory): {filepath}"
-                + (f" ({comment_lines:,} comment lines skipped)" if comment_lines else "")
-            )
-            return operator_counts, full_rule_counts, clean_rules, None, comment_lines
-
+        print_success(
+            f"Processed: {filepath}"
+            + (f" ({comment_lines:,} comment lines skipped)" if comment_lines else "")
+        )
     except Exception as exc:
         print_error(f"Error processing {filepath}: {exc}")
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-                with _cleanup_lock:
-                    if tmp_path in _temp_files_to_cleanup:
-                        _temp_files_to_cleanup.remove(tmp_path)
-            except OSError:
-                pass
-        return defaultdict(int), defaultdict(int), [], None, 0
+        return defaultdict(int), defaultdict(int), 0
+
+    return operator_counts, rule_counts, comment_lines
 
 
 def analyze_rule_files_parallel(
     filepaths: List[str], max_rule_length: int
-) -> Tuple[List, Dict, List]:
+) -> Tuple[List, Dict]:
+    """Parallel rule-file analysis — returns (sorted_op_counts, rule_counts_dict).
+
+    v3.6 (FIX 1 + FIX 2 from markov_rule_generator.py): workers now return only
+    aggregated counts, never a raw-line list and never a temp file.  The old
+    code wrote per-file temp files and then read them all back into RAM solely
+    to populate `all_rules`, which no caller actually used after the function
+    returned.  Dropping the list eliminates the hidden O(total lines) memory
+    spike and the temp-file leak on Ctrl-C.
+
+    Callers that previously consumed the third return value (all_rules) now
+    receive a 2-tuple and must be updated accordingly — in this codebase the
+    third element was always discarded with `_`.
+    """
     valid_fps = [fp for fp in filepaths if os.path.isfile(fp)]
     if not valid_fps:
         print_warning("No valid rule files to process.")
-        return [], defaultdict(int), []
+        return [], defaultdict(int)
 
-    total_op_counts:    Dict[str, int] = defaultdict(int)
-    total_rule_counts:  Dict[str, int] = defaultdict(int)
-    total_comment_lines: int           = 0
-    temp_files: List[str] = []
-    all_rules:  List[str] = []
+    total_op_counts:     Dict[str, int] = defaultdict(int)
+    total_rule_counts:   Dict[str, int] = defaultdict(int)
+    total_comment_lines: int            = 0
 
     n_procs = min(os.cpu_count() or 1, len(valid_fps))
     tasks   = [(fp, max_rule_length) for fp in valid_fps]
     print_info(f"Parallel analysis of {len(valid_fps)} files using {n_procs} processes...")
 
     with multiprocessing.Pool(processes=n_procs) as pool:
-        # v3.5: process_single_file now returns a 5-tuple (adds comment_lines)
-        for op_c, rule_c, rules, tmp, comment_lines in pool.starmap(process_single_file, tasks):
+        for op_c, rule_c, comment_lines in pool.starmap(process_single_file, tasks):
             for op, cnt in op_c.items():
                 total_op_counts[op] += cnt
             for rule, cnt in rule_c.items():
                 total_rule_counts[rule] += cnt
             total_comment_lines += comment_lines
-            if STATE.in_memory_mode:
-                all_rules.extend(rules)
-            elif tmp:
-                temp_files.append(tmp)
-
-    if not STATE.in_memory_mode and temp_files:
-        print_info("Merging temporary rule files...")
-        for tmp in temp_files:
-            try:
-                with open(tmp, 'r', encoding='utf-8') as fh:
-                    all_rules.extend(ln.strip() for ln in fh)
-                os.remove(tmp)
-                with _cleanup_lock:
-                    if tmp in _temp_files_to_cleanup:
-                        _temp_files_to_cleanup.remove(tmp)
-            except OSError as exc:
-                print_error(f"Error merging {tmp}: {exc}")
 
     print_success(f"Total unique rules loaded: {len(total_rule_counts):,}")
     if total_comment_lines:
@@ -913,7 +848,7 @@ def analyze_rule_files_parallel(
             f"{colorize(f'{total_comment_lines:,}', Colors.YELLOW)}"
         )
     sorted_op_counts = sorted(total_op_counts.items(), key=lambda kv: kv[1], reverse=True)
-    return sorted_op_counts, total_rule_counts, all_rules
+    return sorted_op_counts, total_rule_counts
 
 
 # ==============================================================================
@@ -1014,9 +949,11 @@ def get_markov_model(
 def get_markov_weighted_rules(
     unique_rules:         Dict[str, int],
     markov_probabilities: Dict,
-    total_transitions:    Dict,
 ) -> List[Tuple[str, float]]:
     """Score each rule by its log-probability under the token-level Markov model.
+
+    v3.6: removed the unused `total_transitions` parameter (it was accepted but
+    never read) so the signature now matches the standalone markov_rule_generator.
 
     Scoring strategy — highest available context wins at each position:
       1. P(tokens[0] | START)
@@ -1030,8 +967,6 @@ def get_markov_weighted_rules(
     Rules that do not tokenize cleanly (round-trip check fails) are silently
     dropped — they cannot have been produced by the model.
     """
-    if not memory_intensive_operation_warning("Markov weighting"):
-        return []
     START    = '^'
     weighted: List[Tuple[str, float]] = []
 
@@ -1054,7 +989,6 @@ def get_markov_weighted_rules(
         for i in range(1, len(tokens)):
             scored = False
 
-            # 4-gram context: (tok[i-4], tok[i-3], tok[i-2], tok[i-1]) -> tok[i]
             if not scored and i >= 4:
                 key = (tokens[i - 4], tokens[i - 3], tokens[i - 2], tokens[i - 1])
                 if (key in markov_probabilities
@@ -1062,7 +996,6 @@ def get_markov_weighted_rules(
                     logp += math.log(markov_probabilities[key][tokens[i]])
                     scored = True
 
-            # Trigram context: (tok[i-3], tok[i-2], tok[i-1]) -> tok[i]
             if not scored and i >= 3:
                 key = (tokens[i - 3], tokens[i - 2], tokens[i - 1])
                 if (key in markov_probabilities
@@ -1070,7 +1003,6 @@ def get_markov_weighted_rules(
                     logp += math.log(markov_probabilities[key][tokens[i]])
                     scored = True
 
-            # Bigram context: (tok[i-2], tok[i-1]) -> tok[i]
             if not scored and i >= 2:
                 key = (tokens[i - 2], tokens[i - 1])
                 if (key in markov_probabilities
@@ -1078,7 +1010,6 @@ def get_markov_weighted_rules(
                     logp += math.log(markov_probabilities[key][tokens[i]])
                     scored = True
 
-            # Unigram fallback: tok[i-1] -> tok[i]
             if not scored:
                 prev = tokens[i - 1]
                 if prev in markov_probabilities and tokens[i] in markov_probabilities[prev]:
@@ -1104,27 +1035,30 @@ def generate_rules_from_markov_model(
     max_len:              int,
     gpu_mode:             bool = False,
     excluded_operators:   Optional[Set[str]] = None,
+    diversity_weight:     float = 0.0,
 ) -> List[Tuple[str, float]]:
     """Generate *target* valid hashcat rules via best-first Priority Queue search.
 
-    v3.5: PQ generation restored with corrected model semantics (KN + +=1).
-    Rules are emitted in descending probability order — the first N rules are
-    provably the N most likely under the model, unlike the random walk which
-    produced an arbitrary ordering.
+    v3.6 (FIX 3 from markov_rule_generator.py): memory-safety checks now run
+    before *and* periodically during the candidate-collection phase (every 5 000
+    rules emitted), so a runaway --generate-target on a large --markov-length
+    range is caught before it exhausts RAM.
 
-    Skip-gram backoff: when a context has no observed transition, drops one
-    middle position before falling back to shorter context, then KN unigram.
-    PQ is capped at target*15 entries to prevent exponential blowup.
+    Other v3.6 changes:
+      - `diversity_weight` parameter accepted for API compatibility (ignored
+        here; PQ output is already ordered by model probability).
+      - Uses top-level `heapq` import instead of a local alias.
+      - Progress logged every 5 000 rules (was 10 000).
+      - `gpu_mode` retained for caller compatibility but unused (CPU validator
+        is authoritative).
     """
-    import heapq as _heapq
-
     if not memory_intensive_operation_warning("Markov rule generation"):
         return []
     if excluded_operators is None:
         excluded_operators = NEVER_PRODUCE_OPS
 
     print_section(
-        f"Generating Token-Level Markov Rules — Best-First PQ"
+        f"Generating Token-Level Markov Rules — Best-First PQ "
         f"({min_len}–{max_len} tokens, target: {target:,})"
     )
     print_info(f"Excluding operators: {', '.join(sorted(excluded_operators))}")
@@ -1185,13 +1119,13 @@ def generate_rules_from_markov_model(
     n_lengths = max_len - min_len + 1
 
     for tok, prob in starters:
-        _heapq.heappush(pq, (-prob, counter, [tok], prob))
+        heapq.heappush(pq, (-prob, counter, [tok], prob))
         counter += 1
 
     candidates_processed = 0
 
     while pq and len(generated) < target:
-        neg_prob, _, token_seq, prob = _heapq.heappop(pq)
+        neg_prob, _, token_seq, prob = heapq.heappop(pq)
         candidates_processed += 1
         n_tok = len(token_seq)
 
@@ -1203,14 +1137,19 @@ def generate_rules_from_markov_model(
                     and is_valid_hashcat_rule(rule)):
                 generated.add(rule)
                 length_counts[n_tok] += 1
-                if len(generated) % 10000 == 0:
-                    print_info(f"  {len(generated):,}/{target:,} rules  "
+                n_gen = len(generated)
+                if n_gen % 5000 == 0:
+                    # FIX 3: mid-generation memory check
+                    if not memory_intensive_operation_warning("Markov rule generation (mid-run)"):
+                        print_warning("Aborting generation early due to memory pressure.")
+                        break
+                    print_info(f"  {n_gen:,}/{target:,} rules  "
                                f"(queue={len(pq):,}, prob={prob:.6f})")
 
         if n_tok < max_len and len(pq) < PQ_CAP:
             for nxt, trans_prob in _get_transitions(token_seq):
                 new_prob = prob * trans_prob
-                _heapq.heappush(pq, (-new_prob, counter, token_seq + [nxt], new_prob))
+                heapq.heappush(pq, (-new_prob, counter, token_seq + [nxt], new_prob))
                 counter += 1
 
     print_success(
@@ -1224,7 +1163,7 @@ def generate_rules_from_markov_model(
     if not generated:
         return []
     dummy = {r: 1 for r in generated}
-    return get_markov_weighted_rules(dummy, markov_probabilities, {})[:target]
+    return get_markov_weighted_rules(dummy, markov_probabilities)[:target]
 
 
 # ==============================================================================
@@ -2812,7 +2751,7 @@ def process_multiple_files_concentrator(args: Any) -> None:
     STATE.output_format = args.output_format if args.output_format in ('line', 'expanded') else 'line'
     print(f"{Colors.CYAN}Output Format:{Colors.END} {STATE.output_format}")
     set_global_flags(args.temp_dir, args.in_memory)
-    sorted_ops, full_rule_counts, _ = analyze_rule_files_parallel(all_fps, args.max_length)
+    sorted_ops, full_rule_counts = analyze_rule_files_parallel(all_fps, args.max_length)
     if not full_rule_counts:
         print_error("No rules found in files.")
         return
@@ -2881,7 +2820,7 @@ def concentrator_main_processing(args: Any) -> None:
     set_global_flags(args.temp_dir, args.in_memory)
 
     print_section("Parallel Rule File Analysis")
-    sorted_ops, full_rule_counts, _ = analyze_rule_files_parallel(all_fps, args.max_length)
+    sorted_ops, full_rule_counts = analyze_rule_files_parallel(all_fps, args.max_length)
     if not sorted_ops:
         print_error("No operators found. Exiting.")
         return
@@ -2923,7 +2862,7 @@ def concentrator_main_processing(args: Any) -> None:
             if markov_probs is None:
                 print_error("Statistical sort requires the Markov model.")
                 return
-            sorted_by_weight = get_markov_weighted_rules(full_rule_counts, markov_probs, markov_totals)
+            sorted_by_weight = get_markov_weighted_rules(full_rule_counts, markov_probs)
             if gpu_enabled and sorted_by_weight:
                 candidates = [r for r, _ in sorted_by_weight[:args.top_rules * 2]]
                 gpu_valid  = gpu_validate_rules(candidates)
