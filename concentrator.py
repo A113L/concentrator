@@ -2606,6 +2606,7 @@ def enhanced_interactive_processing_loop(
     total_lines:   int,
     args:          Any,
     initial_mode:  str = "extracted",
+    auto_save_filename: Optional[str] = None,
 ) -> List[Tuple[str, int]]:
     current_data = original_data
     orig_count   = len(current_data)
@@ -2727,12 +2728,12 @@ def enhanced_interactive_processing_loop(
             if input(
                 f"{Colors.YELLOW}Save before exiting? (y/N): {Colors.RESET}"
             ).strip().lower() in ('y', 'yes'):
-                save_rules(current_data, mode_name=f"{initial_mode}_filtered")
+                save_rules(current_data, filename=auto_save_filename, mode_name=f"{initial_mode}_filtered")
         except EOFError:
             pass
     except EOFError:
         print(f"\n{Colors.YELLOW}Input closed — exiting interactive menu and saving current dataset.{Colors.RESET}")
-        save_rules(current_data, mode_name=f"{initial_mode}_filtered")
+        save_rules(current_data, filename=auto_save_filename, mode_name=f"{initial_mode}_filtered")
 
     return current_data
 
@@ -2758,7 +2759,8 @@ def process_multiple_files_concentrator(args: Any) -> None:
     rules_data = sorted(full_rule_counts.items(), key=lambda kv: kv[1], reverse=True)
     print_success(f"Loaded {len(rules_data):,} unique rules.")
     final = enhanced_interactive_processing_loop(
-        rules_data, sum(full_rule_counts.values()), args, "processed"
+        rules_data, sum(full_rule_counts.values()), args, "processed",
+        auto_save_filename=args.output_base_name + "_processed.rule",
     )
     if final:
         save_rules(final, filename=args.output_base_name + "_processed.rule", mode_name="processed")
@@ -2922,7 +2924,7 @@ def concentrator_main_processing(args: Any) -> None:
 
     if enter_interactive not in ('n', 'no'):
         total_lines = sum(full_rule_counts.values())
-        final_data  = enhanced_interactive_processing_loop(result_data, total_lines, args, initial_mode)
+        final_data  = enhanced_interactive_processing_loop(result_data, total_lines, args, initial_mode, auto_save_filename=output_file)
         if final_data:
             save_rules(final_data, filename=output_file, mode_name=active_mode)
             print_success(f"Final rules saved → {output_file}")
