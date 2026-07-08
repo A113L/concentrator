@@ -2153,7 +2153,7 @@ def _functional_minimization_sqlite(
 
 @memory_safe_operation("Functional Minimization", 85)
 def functional_minimization(
-    data: List[Tuple[str, int]]
+    data: List[Tuple[str, int]], auto_confirm: bool = False
 ) -> List[Tuple[str, int]]:
     """Eliminate functionally redundant rules using byte-level signature comparison.
 
@@ -2178,7 +2178,9 @@ def functional_minimization(
         print_warning(f"Large dataset: {len(data):,} rules.")
         est = estimate_memory_usage(len(data))
         print(f"{Colors.CYAN}[MEMORY]{Colors.RESET} Estimated: {format_bytes(est)}")
-        if input(
+        if auto_confirm:
+            print_info("Auto-confirm (--yes): proceeding with functional minimization.")
+        elif input(
             f"{Colors.YELLOW}Continue? (y/N): {Colors.RESET}"
         ).strip().lower() not in ('y', 'yes'):
             print_info("Functional minimization skipped.")
@@ -2344,10 +2346,25 @@ def analyze_cumulative_value(
 # FILTERING FUNCTIONS
 # ==============================================================================
 
-def filter_by_min_occurrence(data: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+def filter_by_min_occurrence(
+    data: List[Tuple[str, int]], threshold: Optional[int] = None
+) -> List[Tuple[str, int]]:
+    """Keep rules whose occurrence count is >= threshold.
+
+    v3.6: accepts an explicit `threshold` for non-interactive/CLI use
+    (e.g. `--filter-min-occ N`). When threshold is None, falls back to the
+    original interactive input() prompt loop.
+    """
     if not data:
         return data
     max_cnt   = data[0][1]
+
+    if threshold is not None:
+        thresh = max(1, min(int(threshold), max_cnt))
+        filtered = [(r, c) for r, c in data if c >= thresh]
+        print_success(f"Min occurrence (>= {thresh:,}): kept {len(filtered):,} rules.")
+        return filtered
+
     suggested = max(1, sum(c for _, c in data) // 1000)
     while True:
         try:
@@ -2363,17 +2380,32 @@ def filter_by_min_occurrence(data: List[Tuple[str, int]]) -> List[Tuple[str, int
             print_error("Invalid number.")
 
 
-def filter_by_max_rules(data: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+def filter_by_max_rules(
+    data: List[Tuple[str, int]], limit: Optional[int] = None
+) -> List[Tuple[str, int]]:
+    """Keep only the top `limit` rules (data is assumed pre-sorted by weight).
+
+    v3.6: accepts an explicit `limit` for non-interactive/CLI use
+    (e.g. `--filter-max-rules N`). When limit is None, falls back to the
+    original interactive input() prompt loop.
+    """
     if not data:
         return data
     maximum = len(data)
+
+    if limit is not None:
+        lim = max(1, min(int(limit), maximum))
+        filtered = data[:lim]
+        print_success(f"Top N (max {lim:,}): kept {len(filtered):,} rules.")
+        return filtered
+
     while True:
         try:
-            limit = int(input(
+            lim = int(input(
                 f"{Colors.YELLOW}Enter MAX number of rules to keep (1–{maximum:,}): {Colors.RESET}"
             ))
-            if 1 <= limit <= maximum:
-                filtered = data[:limit]
+            if 1 <= lim <= maximum:
+                filtered = data[:lim]
                 print_success(f"Kept top {len(filtered):,} rules.")
                 return filtered
             print_error(f"Value must be between 1 and {maximum:,}.")
@@ -2381,17 +2413,32 @@ def filter_by_max_rules(data: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
             print_error("Invalid number.")
 
 
-def inverse_mode_filter(data: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+def inverse_mode_filter(
+    data: List[Tuple[str, int]], cutoff: Optional[int] = None
+) -> List[Tuple[str, int]]:
+    """Keep rules ranked BELOW `cutoff` (data is assumed pre-sorted by weight).
+
+    v3.6: accepts an explicit `cutoff` for non-interactive/CLI use
+    (e.g. `--filter-inverse N`). When cutoff is None, falls back to the
+    original interactive input() prompt loop.
+    """
     if not data:
         return data
     maximum = len(data)
+
+    if cutoff is not None:
+        cut = max(0, min(int(cutoff), maximum))
+        filtered = data[cut:]
+        print_success(f"Inverse mode (cutoff {cut:,}): kept {len(filtered):,} rules.")
+        return filtered
+
     while True:
         try:
-            cutoff = int(input(
+            cut = int(input(
                 f"{Colors.YELLOW}Enter cutoff rank (rules BELOW this rank kept, 1–{maximum:,}): {Colors.RESET}"
             ))
-            if 1 <= cutoff <= maximum:
-                filtered = data[cutoff:]
+            if 1 <= cut <= maximum:
+                filtered = data[cut:]
                 print_success(f"Kept {len(filtered):,} rules.")
                 return filtered
             print_error(f"Value must be between 1 and {maximum:,}.")
@@ -2742,9 +2789,70 @@ def enhanced_interactive_processing_loop(
 # MAIN PROCESSING FUNCTIONS
 # ==============================================================================
 
+def _has_non_interactive_filters(args: Any) -> bool:
+    """True if any of the five Step-3b filters were requested via CLI flags."""
+    return any([
+        getattr(args, 'filter_min_occ', None) is not None,
+        getattr(args, 'filter_max_rules', None) is not None,
+        getattr(args, 'filter_func_redundancy', False),
+        getattr(args, 'filter_inverse', None) is not None,
+        getattr(args, 'filter_hashcat_cleanup', None) is not None,
+    ])
+
+
+def apply_filters_non_interactive(
+    data: List[Tuple[str, int]], args: Any
+) -> List[Tuple[str, int]]:
+    """Run the same five filters as the interactive menu (options 1-5), but
+    driven entirely by CLI flags instead of input(). Filters are applied in
+    the fixed order 1→5 (matching the interactive menu), and each one is
+    skipped entirely unless its corresponding flag was passed — so callers
+    (e.g. RCR) can enable any subset independently.
+    """
+    orig_count = len(data)
+    print_header("NON-INTERACTIVE ADVANCED FILTERING (Step 3b)")
+    print(f"Initial dataset: {colorize(f'{orig_count:,}', Colors.CYAN)} unique rules")
+    current = data
+
+    # (1) Min occurrence
+    if getattr(args, 'filter_min_occ', None) is not None:
+        print_section("[1] Filter by MINIMUM OCCURRENCE")
+        current = filter_by_min_occurrence(current, threshold=args.filter_min_occ)
+
+    # (2) Max rules (top N)
+    if getattr(args, 'filter_max_rules', None) is not None:
+        print_section("[2] Filter by MAXIMUM NUMBER OF RULES (top N)")
+        current = filter_by_max_rules(current, limit=args.filter_max_rules)
+
+    # (3) Functional redundancy
+    if getattr(args, 'filter_func_redundancy', False):
+        print_section("[3] Filter by FUNCTIONAL REDUNDANCY")
+        result = functional_minimization(current, auto_confirm=getattr(args, 'yes', False))
+        if result is not None:
+            current = result
+
+    # (4) Inverse mode
+    if getattr(args, 'filter_inverse', None) is not None:
+        print_section("[4] INVERSE MODE")
+        current = inverse_mode_filter(current, cutoff=args.filter_inverse)
+
+    # (5) Hashcat cleanup
+    if getattr(args, 'filter_hashcat_cleanup', None) is not None:
+        print_section("[5] HASHCAT CLEANUP")
+        mode = 2 if args.filter_hashcat_cleanup == 'gpu' else 1
+        current = hashcat_rule_cleanup(current, mode)
+
+    reduction = (orig_count - len(current)) / orig_count * 100 if orig_count else 0.0
+    print_success(
+        f"Non-interactive filtering complete: {len(current):,} rules "
+        f"({reduction:.1f}% reduction from {orig_count:,})"
+    )
+    return current
+
+
 def process_multiple_files_concentrator(args: Any) -> None:
     global STATE
-    print_header("PROCESSING MODE – Interactive Rule Minimization")
+    print_header("PROCESSING MODE – Rule Minimization")
     all_fps = find_rule_files_recursive(args.paths, max_depth=3)
     if not all_fps:
         print_error("No rule files found.")
@@ -2758,10 +2866,18 @@ def process_multiple_files_concentrator(args: Any) -> None:
         return
     rules_data = sorted(full_rule_counts.items(), key=lambda kv: kv[1], reverse=True)
     print_success(f"Loaded {len(rules_data):,} unique rules.")
-    final = enhanced_interactive_processing_loop(
-        rules_data, sum(full_rule_counts.values()), args, "processed",
-        auto_save_filename=args.output_base_name + "_processed.rule",
-    )
+
+    if _has_non_interactive_filters(args):
+        # Non-interactive path — driven by --filter-* CLI flags (used by RCR
+        # and other automated callers). No input() calls occur here.
+        final = apply_filters_non_interactive(rules_data, args)
+    else:
+        # No --filter-* flags given: fall back to the original interactive
+        # terminal menu (unchanged behaviour for manual command-line use).
+        final = enhanced_interactive_processing_loop(
+            rules_data, sum(full_rule_counts.values()), args, "processed",
+            auto_save_filename=args.output_base_name + "_processed.rule",
+        )
     if final:
         save_rules(final, filename=args.output_base_name + "_processed.rule", mode_name="processed")
 
@@ -3157,7 +3273,14 @@ def print_usage() -> None:
          [("-gt INT",     "Target rules (default: 10000)"),
           ("-ml MIN MAX", "Rule length range (default: 1 3)")]),
         ("PROCESSING (-p)",
-         [("-d",    "Use disk for large datasets")]),
+         [("-d",    "Use disk for large datasets"),
+          ("--filter-min-occ N",        "(1) Keep rules occurring >= N times"),
+          ("--filter-max-rules N",      "(2) Keep top N rules"),
+          ("--filter-func-redundancy",  "(3) Remove functionally redundant rules"),
+          ("--filter-inverse N",        "(4) Inverse mode: keep rules ranked below N"),
+          ("--filter-hashcat-cleanup {cpu,gpu}", "(5) Validate rules for hashcat"),
+          ("-y, --yes",                 "Auto-confirm prompts (skip large-run confirmation)"),
+          ("",  "  If no --filter-* flag is given, -p opens the interactive menu.")]),
         ("OUTPUT",
          [("-f FORMAT",  "Output format: line or expanded (default: line)"),
           ("-ob NAME",   "Base name for output file")]),
@@ -3275,6 +3398,25 @@ if __name__ == '__main__':
         parser.add_argument('--temp-dir',  default=None)
         parser.add_argument('--in-memory', action='store_true')
         parser.add_argument('--no-gpu',    action='store_true')
+
+        # ── Non-interactive Step-3b advanced filters (process_rules / -p only) ──
+        # Each flag mirrors one option (1-5) of the interactive processing
+        # menu. Any subset may be supplied; they are always applied in the
+        # fixed order 1→2→3→4→5 regardless of the order given on the command
+        # line. If none of these flags are supplied, -p falls back to the
+        # original interactive menu.
+        parser.add_argument('--filter-min-occ', type=int, default=None, metavar='N',
+                             help='(1) Keep only rules occurring >= N times')
+        parser.add_argument('--filter-max-rules', type=int, default=None, metavar='N',
+                             help='(2) Keep only the top N rules by occurrence')
+        parser.add_argument('--filter-func-redundancy', action='store_true',
+                             help='(3) Remove functionally redundant rules [RAM intensive]')
+        parser.add_argument('--filter-inverse', type=int, default=None, metavar='N',
+                             help='(4) Inverse mode: keep only rules ranked below N')
+        parser.add_argument('--filter-hashcat-cleanup', choices=['cpu', 'gpu'], default=None,
+                             help='(5) Validate rules for hashcat (cpu or gpu mode)')
+        parser.add_argument('-y', '--yes', action='store_true',
+                             help='Auto-confirm prompts (e.g. large functional-redundancy runs)')
 
         args = parser.parse_args()
 
